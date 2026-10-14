@@ -432,6 +432,23 @@ The handler therefore accepts the file part from `content`, `file`, or
 sent. When `sha256_digest` is present it must match the streamed hash or the
 upload is rejected with `400` and the staged blob is discarded.
 
+The multipart body is parsed under a hard cap rather than through
+`request.form()`. Raw bytes are counted as they arrive (never trusting
+`Content-Length`), allowing `max_upload_size_mb` plus an 8 MiB aggregate metadata
+budget and 256 KiB of framing allowance. A request carrying more than one file
+part is rejected outright
+instead of silently ignoring the extras. This matters because Starlette would
+otherwise spool the entire body to temporary files before any size check ran;
+parsed file parts are also closed deterministically once the handler is done.
+
+Up to 1,000 text parts are supported, including repeated dependencies,
+classifiers, and extras sent by Twine. Each text part is limited to 1 MiB, and
+`_UploadMultiPartParser` counts aggregate text and artifact bytes independently
+in its data callback before buffering or queuing file writes. Exceeding either
+aggregate budget raises `413`; Starlette's parser closes temporary files on the
+error. A full-size artifact can therefore carry a README above 64 KiB without
+allowing metadata to consume unbounded memory or enlarge the file-size limit.
+
 `attestations` and `gpg_signature` remain explicitly rejected; current uv does
 not send them by default, so `--no-attestations` is unnecessary but harmless.
 

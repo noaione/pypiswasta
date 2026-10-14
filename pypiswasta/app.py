@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import os
+from contextlib import aclosing
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, AsyncGenerator
 from urllib.parse import unquote
 
 import anyio
@@ -19,7 +20,8 @@ from fastapi.responses import (
 )
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
-from starlette.datastructures import UploadFile
+from starlette.datastructures import FormData, Headers, UploadFile
+from starlette.formparsers import MultiPartException, MultiPartParser
 
 from . import rpc, simple, web
 from .auth import (
@@ -60,6 +62,24 @@ CACHE_PRIVATE_FILE = "private, no-store"
 SETUP_EXEMPT_PATHS = frozenset({"/setup", "/healthz", "/favicon.ico"})
 
 BLOCKED_UPLOAD_FIELDS = ("attestations", "gpg_signature")
+
+# An upload carries exactly one distribution: that is what `uv publish` and
+# `twine upload` send. Accepting more would let a caller make the index receive
+# and spool parts it never publishes, so a second file part is rejected outright
+# rather than silently ignored.
+UPLOAD_MAX_FILES = 1
+# Twine sends dependencies, classifiers and extras as repeated field parts.
+# Keep the parser's usual count limit while separately bounding their total data.
+UPLOAD_MAX_FIELDS = 1000
+# Bound on a single non-file field (bytes). Starlette applies this to text parts
+# only; file parts are covered by the overall request-size cap.
+UPLOAD_MAX_FIELD_BYTES = 1024 * 1024
+# Text parts stay in memory, so their aggregate budget must not grow with the
+# configured artifact size or the number of fields.
+UPLOAD_MAX_METADATA_BYTES = 8 * 1024 * 1024
+# Separate framing allowance for boundaries and headers, in addition to the
+# artifact and metadata budgets. A full-size artifact can still carry a README.
+UPLOAD_MULTIPART_OVERHEAD_BYTES = 256 * 1024
 
 ReaderCredential = Annotated[Credential, Depends(require_reader)]
 UploadCredential = Annotated[Credential, Depends(require_upload)]
@@ -628,6 +648,77 @@ def _serve_file(
 # --------------------------------------------------------------------------- #
 
 
+async def _receive_body_with_size_cap(source: AsyncGenerator[bytes], max_bytes: int) -> AsyncGenerator[bytes]:
+    """Yield request body chunks, aborting once ``max_bytes`` have arrived.
+
+    The count is of *raw received bytes*, so it holds even when a client lies
+    about ``Content-Length`` or streams without one. Raising mid-stream stops us
+    receiving more of an oversized body, and Starlette's multipart parser closes
+    any temporary files it had started when it sees the error.
+    """
+    received = 0
+    async for chunk in source:
+        if not chunk:
+            continue
+        received += len(chunk)
+        if received > max_bytes:
+            raise HTTPException(status_code=413, detail=f"upload body exceeds the maximum of {max_bytes} bytes")
+        yield chunk
+
+
+class _UploadMultiPartParser(MultiPartParser):
+    """Bound aggregate text and file data before the parser buffers or spools it."""
+
+    def __init__(self, headers: Headers, stream: AsyncGenerator[bytes], *, max_file_bytes: int) -> None:
+        super().__init__(
+            headers,
+            stream,
+            max_files=UPLOAD_MAX_FILES,
+            max_fields=UPLOAD_MAX_FIELDS,
+            max_part_size=UPLOAD_MAX_FIELD_BYTES,
+        )
+        self._max_file_bytes = max_file_bytes
+        self._file_bytes = 0
+        self._metadata_bytes = 0
+
+    def on_part_data(self, data: bytes, start: int, end: int) -> None:
+        # Starlette's per-part limit covers text only. Enforce these budgets in
+        # its data callback, before it queues file writes or retains text bytes.
+        size = end - start
+        if self._current_part.file is None:
+            self._metadata_bytes += size
+            if self._metadata_bytes > UPLOAD_MAX_METADATA_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"upload metadata exceeds the maximum of {UPLOAD_MAX_METADATA_BYTES} bytes",
+                )
+        else:
+            self._file_bytes += size
+            if self._file_bytes > self._max_file_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"upload exceeds the maximum size of {self._max_file_bytes} bytes",
+                )
+        super().on_part_data(data, start, end)
+
+
+async def _parse_upload_form(request: Request, *, max_body_bytes: int, max_file_bytes: int) -> FormData:
+    """Parse a multipart upload under a hard total-size cap and bounded shape.
+
+    ``request.form()`` would stream the whole body into spooled temporary files
+    before any size check ran, letting an authenticated caller spool unbounded
+    data to disk. Here the raw bytes are counted as they arrive and the multipart
+    structure (file count, field count, text-field size) is bounded.
+    """
+    async with aclosing(_receive_body_with_size_cap(request.stream(), max_body_bytes)) as stream:
+        parser = _UploadMultiPartParser(
+            request.headers,
+            stream,
+            max_file_bytes=max_file_bytes,
+        )
+        return await parser.parse()
+
+
 async def _handle_upload(request: Request) -> Response:
     config, database, store, _ = _state(request)
 
@@ -635,8 +726,37 @@ async def _handle_upload(request: Request) -> Response:
     if "multipart/form-data" not in content_type.lower():
         raise HTTPException(status_code=400, detail="expected a multipart/form-data upload")
 
-    form = await request.form()
+    max_bytes = config.storage.max_upload_size_mb * 1024 * 1024
+    max_body_bytes = max_bytes + UPLOAD_MAX_METADATA_BYTES + UPLOAD_MULTIPART_OVERHEAD_BYTES
 
+    # Cheap reject when an honest client declares an oversized body; the
+    # streaming cap in ``_parse_upload_form`` is what actually enforces it.
+    declared_length = request.headers.get("content-length")
+    if declared_length is not None and declared_length.isdigit() and int(declared_length) > max_body_bytes:
+        raise HTTPException(status_code=413, detail=f"upload body exceeds the maximum of {max_body_bytes} bytes")
+
+    try:
+        form = await _parse_upload_form(request, max_body_bytes=max_body_bytes, max_file_bytes=max_bytes)
+    except MultiPartException as exc:
+        # Bad framing, too many files or fields, or an oversized text field.
+        raise HTTPException(status_code=400, detail=exc.message) from exc
+
+    try:
+        return await _store_upload(form, config=config, database=database, store=store, max_bytes=max_bytes)
+    finally:
+        # Parsed multipart file parts are spooled temporary files; close them
+        # deterministically instead of leaning on garbage collection.
+        await form.close()
+
+
+async def _store_upload(
+    form: FormData,
+    *,
+    config: Config,
+    database: Database,
+    store: ObjectStore,
+    max_bytes: int,
+) -> Response:
     action = form.get(":action")
     if action is not None and str(action) != UPLOAD_ACTION:
         raise HTTPException(status_code=400, detail=f"unsupported :action value: {action!r}")
@@ -704,7 +824,6 @@ async def _handle_upload(request: Request) -> Response:
             )
 
     chunk_size = config.performance.upload_chunk_size_kb * 1024
-    max_bytes = config.storage.max_upload_size_mb * 1024 * 1024
 
     def _stage() -> tuple[Path, str, int]:
         upload.file.seek(0)

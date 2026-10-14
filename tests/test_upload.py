@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import zipfile
 from dataclasses import replace
+from pathlib import Path
 
+import anyio
+import httpx
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from starlette import formparsers
 
 from conftest import (
     ADMIN_USERNAME,
@@ -14,7 +22,13 @@ from conftest import (
     sdist_filename,
     wheel_filename,
 )
-from pypiswasta.app import create_app
+from pypiswasta.app import (
+    UPLOAD_MAX_FIELD_BYTES,
+    UPLOAD_MAX_FIELDS,
+    UPLOAD_MAX_METADATA_BYTES,
+    _receive_body_with_size_cap,
+    create_app,
+)
 from pypiswasta.config import (
     Config,
     RepositoryConfig,
@@ -284,3 +298,304 @@ def test_accepts_matching_declared_digest(instance) -> None:
     wheel = build_wheel()
     response = instance.upload(wheel, form={"sha256_digest": hashlib.sha256(wheel).hexdigest()})
     assert response.status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# request-size and multipart-structure limits (SR-02)
+# --------------------------------------------------------------------------- #
+
+
+def _upload_credentials(client: TestClient) -> tuple[str, str]:
+    response = client.post("/setup", data={"username": ADMIN_USERNAME})
+    assert response.status_code == 200, response.text
+    return parse_credentials(response.text)["upload"]
+
+
+def _app_with_upload_limit(tmp_path: Path, *, max_upload_size_mb: int):
+    base = default_config(tmp_path / "data")
+    config = replace(base, storage=replace(base.storage, max_upload_size_mb=max_upload_size_mb))
+    config_path = tmp_path / "config.toml"
+    write_config_atomic(config_path, render_config(config))
+    return create_app(config_path)
+
+
+@pytest.mark.parametrize("extra_field", ["extra", "file"])
+def test_rejects_requests_with_more_than_one_file(instance, extra_field) -> None:
+    """A second file part is rejected outright rather than silently ignored."""
+    response = instance.client.post(
+        "/legacy/",
+        data={":action": "file_upload", "name": "demo", "version": "1.0.0"},
+        files=[
+            ("file", (wheel_filename(), build_wheel(), "application/octet-stream")),
+            (
+                extra_field,
+                (sdist_filename("extra", "1.0.0"), build_sdist("extra", "1.0.0"), "application/octet-stream"),
+            ),
+        ],
+        auth=instance.auth("upload"),
+    )
+    assert response.status_code == 400
+    assert "files" in response.json()["detail"].lower()
+
+    # Neither file was published.
+    assert instance.client.app.state.database.list_installable_projects() == []
+
+
+def test_accepts_repeated_publishing_metadata(instance) -> None:
+    """Twine expands dependencies, classifiers and extras into separate parts."""
+    dependencies = [f"dependency-{index}>=1.0" for index in range(30)]
+    extras = [f"feature-{index}" for index in range(12)]
+    classifiers = ["Programming Language :: Python", "Programming Language :: Python :: 3"]
+    metadata = (
+        "Metadata-Version: 2.1\nName: demo\nVersion: 1.0.0\n"
+        + "".join(f"Requires-Dist: {value}\n" for value in dependencies)
+        + "".join(f"Provides-Extra: {value}\n" for value in extras)
+        + "".join(f"Classifier: {value}\n" for value in classifiers)
+        + "\n"
+    ).encode()
+    wheel = build_wheel(extra_members={"demo-1.0.0.dist-info/METADATA": metadata})
+    response = instance.client.post(
+        "/legacy/",
+        data={
+            ":action": "file_upload",
+            "protocol_version": "1",
+            "name": "demo",
+            "version": "1.0.0",
+            "filetype": "bdist_wheel",
+            "pyversion": "py3",
+            "metadata_version": "2.1",
+            "requires_dist": dependencies,
+            "classifiers": classifiers,
+            "provides_extra": extras,
+        },
+        files={"content": (wheel_filename(), wheel, "application/octet-stream")},
+        auth=instance.auth("upload"),
+    )
+    assert response.status_code == 200, response.text
+    sidecar = instance.client.get(
+        f"/private/files/{response.json()['sha256']}/{wheel_filename()}.metadata",
+        auth=instance.auth("reader"),
+    )
+    assert sidecar.content == metadata
+
+
+@pytest.mark.parametrize("near_file_limit", [False, True])
+def test_accepts_large_description_within_metadata_budget(tmp_path, near_file_limit) -> None:
+    """A README above 64 KiB also works with an artifact at its size limit."""
+    description = "Package documentation.\n" * 4096
+    metadata = ("Metadata-Version: 2.1\nName: demo\nVersion: 1.0.0\n\n" + description).encode()
+    wheel = build_wheel(extra_members={"demo-1.0.0.dist-info/METADATA": metadata})
+    if near_file_limit:
+
+        def padded_wheel(size: int) -> bytes:
+            buffer = io.BytesIO(wheel)
+            with zipfile.ZipFile(buffer, "a") as archive:
+                archive.writestr("demo/padding.bin", b"x" * size, compress_type=zipfile.ZIP_STORED)
+            return buffer.getvalue()
+
+        wheel = padded_wheel(1024 * 1024 - len(padded_wheel(0)))
+        assert len(wheel) == 1024 * 1024
+
+    with TestClient(_app_with_upload_limit(tmp_path, max_upload_size_mb=1)) as client:
+        auth = _upload_credentials(client)
+        response = client.post(
+            "/legacy/",
+            data={"name": "demo", "version": "1.0.0", "description": description},
+            files={"content": (wheel_filename(), wheel, "application/octet-stream")},
+            auth=auth,
+        )
+        assert response.status_code == 200, response.text
+        row = client.app.state.database.get_package("demo")
+        assert client.app.state.database.list_artifacts(row["id"])[0]["size"] == len(wheel)
+
+
+def test_oversized_extra_part_does_not_bypass_the_upload_limit(tmp_path) -> None:
+    """A large ignored part used to be spooled to disk and the wheel still passed.
+
+    The rejection comes from whichever guard fires first -- the total body cap
+    (when the body arrives in one chunk) or the single-file rule (when it streams
+    in smaller pieces) -- but the request must never succeed.
+    """
+    app = _app_with_upload_limit(tmp_path, max_upload_size_mb=1)
+    with TestClient(app) as client:
+        auth = _upload_credentials(client)
+        response = client.post(
+            "/legacy/",
+            data={":action": "file_upload", "name": "demo", "version": "1.0.0"},
+            files={
+                "file": (wheel_filename(), build_wheel(), "application/octet-stream"),
+                "unused": ("rejected.exe", b"\x00" * (2 * 1024 * 1024), "application/octet-stream"),
+            },
+            auth=auth,
+        )
+        assert response.status_code in (400, 413)
+        # The wheel the caller expected to publish was not stored either.
+        assert client.app.state.database.list_installable_projects(visibility="private") == []
+
+
+def test_rejects_an_oversized_upload(tmp_path) -> None:
+    app = _app_with_upload_limit(tmp_path, max_upload_size_mb=1)
+    with TestClient(app) as client:
+        auth = _upload_credentials(client)
+        response = client.post(
+            "/legacy/",
+            data={":action": "file_upload", "name": "demo", "version": "1.0.0"},
+            files={"file": (wheel_filename(), b"\x00" * (2 * 1024 * 1024), "application/octet-stream")},
+            auth=auth,
+        )
+    assert response.status_code == 413
+
+
+def test_rejects_a_request_body_over_the_size_cap(tmp_path) -> None:
+    """The whole request body is capped, not just the selected file."""
+    app = _app_with_upload_limit(tmp_path, max_upload_size_mb=1)
+    with TestClient(app) as client:
+        auth = _upload_credentials(client)
+        # A file at its limit plus text exceeding the metadata/framing allowance
+        # must still be rejected by the complete request-body cap.
+        padding = {f"pad{index}": "x" * UPLOAD_MAX_FIELD_BYTES for index in range(9)}
+        response = client.post(
+            "/legacy/",
+            data={":action": "file_upload", "name": "demo", "version": "1.0.0", **padding},
+            files={"file": (wheel_filename(), b"\x00" * (1024 * 1024), "application/octet-stream")},
+            auth=auth,
+        )
+    assert response.status_code == 413
+
+
+def test_rejects_more_form_fields_than_allowed(instance) -> None:
+    extra = {f"field{index}": "x" for index in range(UPLOAD_MAX_FIELDS + 1)}
+    response = instance.client.post(
+        "/legacy/",
+        data={":action": "file_upload", "name": "demo", "version": "1.0.0", **extra},
+        files={"file": (wheel_filename(), build_wheel(), "application/octet-stream")},
+        auth=instance.auth("upload"),
+    )
+    assert response.status_code == 400
+
+
+def test_rejects_oversized_text_field(instance) -> None:
+    response = instance.upload(build_wheel(), form={"description": "x" * (UPLOAD_MAX_FIELD_BYTES + 1)})
+    assert response.status_code == 400
+    assert "Part exceeded" in response.json()["detail"]
+    assert instance.client.app.state.database.list_installable_projects() == []
+
+
+def test_accepts_metadata_at_aggregate_budget(tmp_path) -> None:
+    with TestClient(_app_with_upload_limit(tmp_path, max_upload_size_mb=1)) as client:
+        auth = _upload_credentials(client)
+        response = client.post(
+            "/legacy/",
+            data={
+                f"field{index}": "x" * UPLOAD_MAX_FIELD_BYTES
+                for index in range(UPLOAD_MAX_METADATA_BYTES // UPLOAD_MAX_FIELD_BYTES)
+            },
+            files={"file": (wheel_filename(), build_wheel(), "application/octet-stream")},
+            auth=auth,
+        )
+        assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize("budget", ["file", "metadata"])
+def test_streamed_part_budgets_stop_early_and_close_files(tmp_path, monkeypatch, budget) -> None:
+    """The framing/metadata allowance cannot enlarge file or text-data budgets."""
+    app = _app_with_upload_limit(tmp_path, max_upload_size_mb=2)
+    with TestClient(app) as client:
+        auth = _upload_credentials(client)
+
+    temporary_files = []
+    original_tempfile = formparsers.SpooledTemporaryFile
+
+    def tracked_tempfile(*args, **kwargs):
+        handle = original_tempfile(*args, **kwargs)
+        temporary_files.append(handle)
+        return handle
+
+    monkeypatch.setattr(formparsers, "SpooledTemporaryFile", tracked_tempfile)
+    chunks_received = 0
+    boundary = "pypiswasta-budget-test"
+    chunk_size = 64 * 1024
+
+    async def body():
+        nonlocal chunks_received
+        yield (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{wheel_filename()}"\r\n\r\n'
+        ).encode()
+        if budget == "file":
+            for _ in range(64):
+                chunks_received += 1
+                yield b"x" * chunk_size
+        else:
+            yield build_wheel()
+            for index in range(9):
+                yield (f'\r\n--{boundary}\r\nContent-Disposition: form-data; name="field{index}"\r\n\r\n').encode()
+                for _ in range(UPLOAD_MAX_FIELD_BYTES // chunk_size):
+                    chunks_received += 1
+                    yield b"x" * chunk_size
+        yield f"\r\n--{boundary}--\r\n".encode()
+
+    async def send():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            return await client.post(
+                "/legacy/",
+                content=body(),
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                auth=auth,
+            )
+
+    response = anyio.run(send)
+    assert response.status_code == 413, response.text
+    assert "content-length" not in response.request.headers
+    if budget == "file":
+        assert "upload exceeds" in response.json()["detail"]
+        assert chunks_received < 64
+        assert temporary_files[0]._rolled  # Actually exercised cleanup of a disk-backed file.
+    else:
+        assert "metadata exceeds" in response.json()["detail"]
+        assert chunks_received < 9 * UPLOAD_MAX_FIELD_BYTES // chunk_size
+    assert len(temporary_files) == 1
+    assert temporary_files[0].closed
+    assert app.state.database.list_installable_projects() == []
+
+
+def test_body_size_cap_stops_before_reading_the_whole_body() -> None:
+    """The cap aborts mid-stream instead of buffering the whole oversized body."""
+    consumed = 0
+
+    async def source():
+        nonlocal consumed
+        for _ in range(100):
+            consumed += 1
+            yield b"x" * 4096
+
+    async def drain() -> HTTPException:
+        with pytest.raises(HTTPException) as caught:
+            async for _chunk in _receive_body_with_size_cap(source(), 4 * 4096):
+                pass
+        return caught.value
+
+    error = anyio.run(drain)
+    assert error.status_code == 413
+    # Four chunks fit the budget; the fifth trips it and nothing more is pulled.
+    assert consumed == 5
+
+
+def test_body_cap_applies_without_a_content_length(tmp_path) -> None:
+    """A streamed (chunked) body with no Content-Length is still capped."""
+    app = _app_with_upload_limit(tmp_path, max_upload_size_mb=1)
+    with TestClient(app) as client:
+        auth = _upload_credentials(client)
+        boundary = "----pypiswasta-stream"
+        head = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="file"; filename="demo-1.0.0.whl"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n"
+        ).encode()
+        tail = f"\r\n--{boundary}--\r\n".encode()
+        response = client.post(
+            "/legacy/",
+            content=iter([head, b"\x00" * (2 * 1024 * 1024), tail]),
+            headers={"content-type": f"multipart/form-data; boundary={boundary}"},
+            auth=auth,
+        )
+    assert response.status_code == 413
