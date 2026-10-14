@@ -83,11 +83,15 @@ class _BudgetedReader(io.RawIOBase):
         """Fill ``buffer``, refusing to let the archive outgrow the budget.
 
         ``RawIOBase.read`` is implemented on top of this, so enforcing the limit
-        here covers every read path without also overriding ``read``.
+        here covers every read path without overriding ``read`` as well.
 
         The budget counts every byte ever read, so seeking backwards and
-        re-reading cannot escape it -- it only makes the limit bite sooner.
+        re-reading cannot escape it -- it only makes the limit bite sooner. The
+        closed check is needed because ``RawIOBase.read`` does not perform one:
+        without it a closed reader would keep handing out bytes.
         """
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
         view = memoryview(buffer).cast("B")
         chunk = self._stream.read(len(view))
         size = len(chunk)
@@ -96,6 +100,16 @@ class _BudgetedReader(io.RawIOBase):
         view[:size] = chunk
         self._consumed += size
         return size
+
+    def write(self, b: Buffer, /) -> int:
+        """Refuse writes with the error every other read-only file object raises.
+
+        ``RawIOBase`` leaves ``write`` unimplemented, so the inherited behaviour
+        is ``NotImplementedError`` -- a ``RuntimeError``, which reads as a missing
+        implementation rather than a deliberate refusal. ``seek`` and ``tell``
+        already raise ``io.UnsupportedOperation``, so this keeps it uniform.
+        """
+        raise io.UnsupportedOperation("_BudgetedReader is read-only")
 
 
 def _parse_pkg_info(data: bytes, name: str, version: str) -> str | None:
