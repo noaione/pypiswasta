@@ -377,6 +377,9 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     database = _open_db(config)
     store = _open_store(config)
 
+    # First pass (unlocked): identify plausible garbage. This is only a
+    # snapshot -- a publisher may make one of these blobs live again before we
+    # act, so the reference check is repeated under the write lock below.
     referenced_wheels, referenced_metadata = database.referenced_digests()
     now = time.time()
     candidates: list[tuple[str, str, Path, int]] = []
@@ -396,16 +399,38 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         print("nothing to collect")
         return 0
 
-    total = 0
-    for kind, digest, path, size in candidates:
-        total += size
-        if args.dry_run:
+    if args.dry_run:
+        total = sum(size for _kind, _digest, _path, size in candidates)
+        for kind, digest, _path, size in candidates:
             print(f"would remove {kind} {digest} ({size} bytes)")
-        else:
-            path.unlink()
-            print(f"removed {kind} {digest} ({size} bytes)")
-    verb = "would free" if args.dry_run else "freed"
-    print(f"{verb} {total} bytes from {len(candidates)} unreferenced blob(s)")
+        print(f"would free {total} bytes from {len(candidates)} unreferenced blob(s)")
+        return 0
+
+    # Deletion must be coordinated with publishing. An upload publishes its
+    # objects and inserts the reference inside a single BEGIN IMMEDIATE
+    # transaction, so taking the same write lock here lets us re-read the live
+    # references and unlink while no publisher can add a reference to a
+    # candidate. This is what protects a blob that a re-upload made live again:
+    # reusing an existing content-addressed object keeps its old modification
+    # time, so the grace period alone would not spare it.
+    removed: list[tuple[str, str, int]] = []
+    total = 0
+    with database.write():
+        live_wheels, live_metadata = database.referenced_digests()
+        live = {OBJECT_KIND: live_wheels, METADATA_KIND: live_metadata}
+        for kind, digest, path, size in candidates:
+            if digest in live[kind]:
+                continue
+            try:
+                path.unlink()
+            except FileNotFoundError:  # pragma: no cover - concurrent removal
+                continue
+            removed.append((kind, digest, size))
+            total += size
+
+    for kind, digest, size in removed:
+        print(f"removed {kind} {digest} ({size} bytes)")
+    print(f"freed {total} bytes from {len(removed)} unreferenced blob(s)")
     return 0
 
 

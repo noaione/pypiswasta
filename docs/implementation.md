@@ -720,3 +720,20 @@ any accent that is not a 3-, 6- or 8-digit hex colour. `render_config()` writes
 the section back out with explanatory comments and the example footer inside a
 comment, so `pypiswasta init` produces a self-documenting file.
 
+### 15.13 Garbage collection is coordinated with publishing (§8/§9)
+
+`pypiswasta gc` finds unreferenced object and metadata blobs by scanning the store
+and comparing digests against `artifacts`, then unlinks the ones older than
+`--grace-seconds` (default one hour). The scan is unlocked, but the live-reference
+check and the unlink happen together inside a single `BEGIN IMMEDIATE` write
+transaction.
+
+That lock is the point. Publishing already runs inside `BEGIN IMMEDIATE` (§15.4:
+objects are written and the reference inserted in one transaction), so taking the
+same lock during deletion means no publisher can make a candidate live again
+between the check and the unlink. Without it, a re-upload that lands after GC's
+snapshot could reference a blob GC then deleted -- and because re-publishing
+reuses an existing content-addressed object (keeping its old modification time),
+the grace period alone would not spare it. If GC wins the race instead, the later
+upload re-installs a fresh object.
+

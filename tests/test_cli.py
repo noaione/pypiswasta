@@ -1,10 +1,22 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
+from fastapi.testclient import TestClient
+
+from conftest import ADMIN_USERNAME, build_wheel, parse_credentials, wheel_filename
+from pypiswasta.app import create_app
 from pypiswasta.cli import main
+from pypiswasta.db import Database
 from pypiswasta.storage import METADATA as METADATA_KIND
 from pypiswasta.storage import OBJECT as OBJECT_KIND
 from pypiswasta.storage import ObjectStore
@@ -181,6 +193,207 @@ def test_gc_respects_grace_period(tmp_path: Path, capsys) -> None:
     )
     assert "nothing to collect" in capsys.readouterr().out
     assert store.object_path(digest).exists()
+
+
+# --------------------------------------------------------------------------- #
+# garbage collection vs. concurrent publishing (SR-03)
+# --------------------------------------------------------------------------- #
+
+
+def _init_config(tmp_path: Path, capsys) -> str:
+    config_path = tmp_path / "config.toml"
+    code = main(["init", "--config", str(config_path), "--data-dir", str(tmp_path / "data")])
+    assert code == 0
+    capsys.readouterr()
+    return str(config_path)
+
+
+def _publish_demo_wheel(client: TestClient, wheel: bytes) -> dict[str, tuple[str, str]]:
+    response = client.post("/setup", data={"username": ADMIN_USERNAME})
+    assert response.status_code == 200, response.text
+    credentials = parse_credentials(response.text)
+    upload = client.post(
+        "/legacy/",
+        data={":action": "file_upload", "name": "demo", "version": "1.0.0"},
+        files={"file": (wheel_filename("demo", "1.0.0"), wheel, "application/octet-stream")},
+        auth=credentials["upload"],
+    )
+    assert upload.status_code == 200, upload.text
+    return credentials
+
+
+def test_gc_keeps_blobs_that_are_still_referenced(tmp_path: Path, capsys) -> None:
+    config_path = _init_config(tmp_path, capsys)
+    wheel = build_wheel("demo", "1.0.0")
+
+    with TestClient(create_app(config_path)) as client:
+        _publish_demo_wheel(client, wheel)
+        object_path = client.app.state.store.object_path(hashlib.sha256(wheel).hexdigest())
+
+        # A referenced blob is never a candidate, even with no grace period.
+        assert main(["gc", "--grace-seconds", "0", "--config", config_path]) == 0
+        assert "nothing to collect" in capsys.readouterr().out
+        assert object_path.exists()
+
+
+def test_gc_does_not_delete_a_blob_made_live_during_the_run(tmp_path: Path, capsys, monkeypatch) -> None:
+    """A re-upload landing after GC's snapshot must not lose its objects."""
+    config_path = _init_config(tmp_path, capsys)
+    wheel = build_wheel("demo", "1.0.0")
+    filename = wheel_filename("demo", "1.0.0")
+
+    with TestClient(create_app(config_path)) as client:
+        credentials = _publish_demo_wheel(client, wheel)
+        database = client.app.state.database
+        store = client.app.state.store
+
+        digest = hashlib.sha256(wheel).hexdigest()
+        package = database.get_package("demo")
+        assert package is not None
+        artifact = database.get_artifact(package["id"], filename)
+        assert artifact is not None
+        metadata_digest = artifact["metadata_sha256"]
+
+        # Drop the records, leaving the objects on disk as orphans...
+        with database.write() as conn:
+            database.delete_package(conn, "demo")
+
+        object_path = store.object_path(digest)
+        metadata_path = store.metadata_path(metadata_digest)
+        assert object_path.exists()
+        assert metadata_path.exists()
+        metadata_bytes = metadata_path.read_bytes()
+
+        # ...and age them well past any grace period.
+        old = time.time() - 7200
+        os.utime(object_path, (old, old))
+        os.utime(metadata_path, (old, old))
+
+        # Re-upload the identical wheel after GC's snapshot but before it
+        # deletes. The content-addressed objects are reused (keeping their old
+        # mtime), so only a reference check coordinated with publishing saves
+        # them from collection.
+        real_iter_blobs = ObjectStore.iter_blobs
+        reuploaded = False
+
+        def iter_blobs_then_reupload(self, kind):
+            nonlocal reuploaded
+            yield from real_iter_blobs(self, kind)
+            if not reuploaded:
+                reuploaded = True
+                again = client.post(
+                    "/legacy/",
+                    data={":action": "file_upload", "name": "demo", "version": "1.0.0"},
+                    files={"file": (filename, wheel, "application/octet-stream")},
+                    auth=credentials["upload"],
+                )
+                assert again.status_code == 200, again.text
+
+        monkeypatch.setattr(ObjectStore, "iter_blobs", iter_blobs_then_reupload)
+
+        assert main(["gc", "--grace-seconds", "3600", "--config", config_path]) == 0
+
+        # Nothing was collected and the re-referenced objects are intact.
+        assert "from 0 unreferenced blob(s)" in capsys.readouterr().out
+        assert object_path.exists()
+        assert metadata_path.exists()
+        live_wheels, live_metadata = database.referenced_digests()
+        assert digest in live_wheels
+        assert metadata_digest in live_metadata
+
+        download = client.get(f"/private/files/{digest}/{filename}", auth=credentials["reader"])
+        sidecar = client.get(f"/private/files/{digest}/{filename}.metadata", auth=credentials["reader"])
+        assert download.status_code == sidecar.status_code == 200
+        assert download.content == wheel
+        assert sidecar.content == metadata_bytes
+
+
+def test_upload_restores_blobs_when_gc_deletes_first(tmp_path: Path, capsys, monkeypatch) -> None:
+    """An upload waiting on GC's write lock must reinstall the collected blobs."""
+    config_path = _init_config(tmp_path, capsys)
+    wheel = build_wheel("demo", "1.0.0")
+    filename = wheel_filename("demo", "1.0.0")
+    digest = hashlib.sha256(wheel).hexdigest()
+
+    with TestClient(create_app(config_path)) as client:
+        credentials = _publish_demo_wheel(client, wheel)
+        database = client.app.state.database
+        store = client.app.state.store
+        package = database.get_package("demo")
+        assert package is not None
+        artifact = database.get_artifact(package["id"], filename)
+        assert artifact is not None
+        metadata_digest = artifact["metadata_sha256"]
+        object_path = store.object_path(digest)
+        metadata_path = store.metadata_path(metadata_digest)
+        metadata_bytes = metadata_path.read_bytes()
+
+        with database.write() as conn:
+            database.delete_package(conn, "demo")
+        old = time.time() - 7200
+        for path in (object_path, metadata_path):
+            os.utime(path, (old, old))
+
+        deletion_started = threading.Event()
+        upload_attempted_write = threading.Event()
+        original_write = Database.write
+        original_unlink = Path.unlink
+        upload_future = None
+
+        @contextmanager
+        def observe_write(self):
+            if deletion_started.is_set():
+                upload_attempted_write.set()
+            with original_write(self) as conn:
+                yield conn
+
+        def reupload():
+            return client.post(
+                "/legacy/",
+                files={"file": (filename, wheel, "application/octet-stream")},
+                auth=credentials["upload"],
+            )
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+
+            def unlink_with_pending_upload(path, *args, **kwargs):
+                nonlocal upload_future
+                if path in (object_path, metadata_path) and upload_future is None:
+                    # Prove GC holds the writer lock through unlink. An unlocked
+                    # reference recheck would let this independent writer in.
+                    # Probe before starting the upload so its own write lock
+                    # cannot accidentally satisfy this assertion.
+                    probe = sqlite3.connect(database.path, timeout=0)
+                    try:
+                        with pytest.raises(sqlite3.OperationalError, match="locked"):
+                            probe.execute("BEGIN IMMEDIATE")
+                    finally:
+                        probe.close()
+
+                    # Start the upload while GC is paused at its first deletion,
+                    # and wait for its transaction attempt without using sleeps.
+                    deletion_started.set()
+                    upload_future = pool.submit(reupload)
+                    assert upload_attempted_write.wait(timeout=5), "upload did not reach its write transaction"
+                return original_unlink(path, *args, **kwargs)
+
+            monkeypatch.setattr(Database, "write", observe_write)
+            monkeypatch.setattr(Path, "unlink", unlink_with_pending_upload)
+            assert main(["gc", "--config", config_path]) == 0
+            assert "from 2 unreferenced blob(s)" in capsys.readouterr().out
+            assert upload_future is not None
+            response = upload_future.result(timeout=5)
+            assert response.status_code == 200, response.text
+            assert response.json()["sha256"] == digest
+
+        live_wheels, live_metadata = database.referenced_digests()
+        assert digest in live_wheels
+        assert metadata_digest in live_metadata
+        download = client.get(f"/private/files/{digest}/{filename}", auth=credentials["reader"])
+        sidecar = client.get(f"/private/files/{digest}/{filename}.metadata", auth=credentials["reader"])
+        assert download.status_code == sidecar.status_code == 200
+        assert download.content == wheel
+        assert sidecar.content == metadata_bytes
 
 
 def test_missing_configuration_file_is_reported(tmp_path: Path, capsys) -> None:
