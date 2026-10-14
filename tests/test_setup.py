@@ -102,3 +102,15 @@ def test_setup_survives_username_collision_with_generated_roles(client) -> None:
     assert credentials["admin"][0] == "reader"
     assert credentials["reader"][0] != "reader"
     assert len({value[0] for value in credentials.values()}) == 3
+
+
+def test_landing_footer_stays_inside_the_content_container(client) -> None:
+    """The footer must live inside <main> so it shares the centred max-width."""
+    assert client.post("/setup", data={"username": ADMIN_USERNAME}).status_code == 200
+
+    page = client.get("/").text
+    assert page.count("<footer>") == 1
+
+    inside_main = page.split("<main>", 1)[1].split("</main>", 1)[0]
+    assert "<footer>" in inside_main
+    assert "SQLite" in inside_main

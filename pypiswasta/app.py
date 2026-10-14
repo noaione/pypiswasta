@@ -435,17 +435,17 @@ def _install_routes(app: FastAPI) -> None:
 def _root_index(request: Request, *, visibility: str | None, prefix: str, cache: str) -> Response:
     _, database, _, _ = _state(request)
     names = [row["name"] for row in database.list_installable_projects(visibility=visibility)]
-    fmt = simple.preferred_format(request.headers.get("accept"))
+    negotiated = simple.negotiate(request.headers.get("accept"))
     headers = {"Vary": "Accept", "Cache-Control": cache}
-    if fmt == simple.FORMAT_JSON:
+    if negotiated.format == simple.FORMAT_JSON:
         return Response(
             simple.render_root_json(names),
-            media_type=simple.MEDIA_JSON,
+            media_type=negotiated.media_type,
             headers=headers,
         )
     return Response(
         simple.render_root_html(names, prefix=prefix),
-        media_type=f"{simple.MEDIA_HTML}; charset=utf-8",
+        media_type=negotiated.media_type,
         headers=headers,
     )
 
@@ -465,17 +465,17 @@ def _project_index(request: Request, raw_name: str, *, visibility: str | None, p
         raise _not_found()
 
     entries = _file_entries(artifacts, prefix=prefix)
-    fmt = simple.preferred_format(request.headers.get("accept"))
+    negotiated = simple.negotiate(request.headers.get("accept"))
     headers = {"Vary": "Accept", "Cache-Control": cache}
-    if fmt == simple.FORMAT_JSON:
+    if negotiated.format == simple.FORMAT_JSON:
         return Response(
             simple.render_project_json(name, entries),
-            media_type=simple.MEDIA_JSON,
+            media_type=negotiated.media_type,
             headers=headers,
         )
     return Response(
         simple.render_project_html(name, entries),
-        media_type=f"{simple.MEDIA_HTML}; charset=utf-8",
+        media_type=negotiated.media_type,
         headers=headers,
     )
 

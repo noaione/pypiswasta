@@ -39,7 +39,9 @@ def _upload_private(instance, name: str = "secret", version: str = "1.0.0"):
 def test_empty_root_index_is_valid_html(instance) -> None:
     response = instance.client.get("/simple/")
     assert response.status_code == 200
-    assert response.headers["content-type"].startswith(HTML_MEDIA)
+    # Browsers (and httpx's default `Accept: */*`) must get renderable HTML.
+    assert response.headers["content-type"].startswith("text/html")
+    assert "<!DOCTYPE html>" in response.text
     assert 'meta name="pypi:repository-version" content="1.1"' in response.text
     assert response.headers["vary"] == "Accept"
     assert response.headers["cache-control"] == "no-cache, must-revalidate"
@@ -130,7 +132,7 @@ def test_project_html_uses_root_absolute_urls(instance) -> None:
 
     response = instance.client.get("/simple/demo/")
     assert response.status_code == 200
-    assert response.headers["content-type"].startswith(HTML_MEDIA)
+    assert response.headers["content-type"].startswith("text/html")
     assert '<meta name="pypi:repository-version" content="1.1">' in response.text
     assert f'href="/files/{digest}/demo-1.0.0-py3-none-any.whl#sha256={digest}"' in response.text
     assert ">demo-1.0.0-py3-none-any.whl</a>" in response.text
@@ -152,18 +154,42 @@ def test_content_negotiation(instance) -> None:
 
     json_response = instance.client.get("/simple/", headers={"Accept": f"{JSON_MEDIA};q=0.9, text/html;q=0.8"})
     assert json_response.headers["content-type"].startswith(JSON_MEDIA)
+    assert json_response.headers["vary"] == "Accept"
 
+    # A real browser Accept header must yield *renderable* HTML, not the vendor
+    # media type, which browsers treat as a download.
     browser = instance.client.get(
         "/simple/",
         headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
     )
-    assert browser.headers["content-type"].startswith(HTML_MEDIA)
+    assert browser.headers["content-type"].startswith("text/html")
+    assert "<!DOCTYPE html>" in browser.text
 
     no_header = instance.client.get("/simple/", headers={"Accept": ""})
-    assert no_header.headers["content-type"].startswith(HTML_MEDIA)
+    assert no_header.headers["content-type"].startswith("text/html")
 
     wildcard = instance.client.get("/simple/", headers={"Accept": "*/*"})
-    assert wildcard.headers["content-type"].startswith(HTML_MEDIA)
+    assert wildcard.headers["content-type"].startswith("text/html")
+
+
+def test_explicit_media_types_are_echoed(instance) -> None:
+    _publish_public(instance, "demo")
+
+    vendor_html = instance.client.get("/simple/", headers={"Accept": HTML_MEDIA})
+    assert vendor_html.headers["content-type"] == f"{HTML_MEDIA}; charset=utf-8"
+
+    project = instance.client.get("/simple/demo/", headers={"Accept": HTML_MEDIA})
+    assert project.headers["content-type"] == f"{HTML_MEDIA}; charset=utf-8"
+
+    plain_json = instance.client.get("/simple/", headers={"Accept": "application/json"})
+    assert plain_json.headers["content-type"].startswith("application/json")
+
+    # text/html is not acceptable when the client only allows application/*.
+    app_wildcard = instance.client.get("/simple/", headers={"Accept": "application/*"})
+    assert app_wildcard.headers["content-type"] == f"{HTML_MEDIA}; charset=utf-8"
+
+    vendor_json = instance.client.get("/simple/", headers={"Accept": JSON_MEDIA})
+    assert vendor_json.headers["content-type"].startswith(JSON_MEDIA)
 
 
 def test_root_json_lists_project_names(instance) -> None:

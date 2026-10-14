@@ -3,6 +3,11 @@
 Implements Accept negotiation (with q-values, wildcards and a browser friendly
 fallback) and the current Simple API media types, including the PEP 700
 ``versions``/``size`` fields and the PEP 714 ``core-metadata`` sidecar digest.
+
+Negotiation also chooses the *response* media type. A client that asks for
+``text/html`` is answered with ``text/html``: browsers treat the vendor type
+``application/vnd.pypi.simple.v1+html`` as an unknown type and download the body
+instead of rendering it.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ API_VERSION = "1.1"
 
 MEDIA_JSON = "application/vnd.pypi.simple.v1+json"
 MEDIA_HTML = "application/vnd.pypi.simple.v1+html"
+MEDIA_APPLICATION_JSON = "application/json"
 MEDIA_TEXT_HTML = "text/html"
 
 _FORMAT_JSON = "json"
@@ -79,40 +85,60 @@ def _specificity(media: str, type_: str, subtype: str) -> int:
     return 0
 
 
-def _best_match(items: list[tuple[str, float]], type_: str, subtype: str) -> tuple[float, int]:
-    best = (-1.0, 0)
+# (type, subtype, media type to answer with) for each representation.
+_JSON_TARGETS: tuple[tuple[str, str, str], ...] = (
+    ("application", "vnd.pypi.simple.v1+json", MEDIA_JSON),
+    ("application", "json", MEDIA_APPLICATION_JSON),
+)
+_HTML_TARGETS: tuple[tuple[str, str, str], ...] = (
+    ("text", "html", MEDIA_TEXT_HTML),
+    ("application", "vnd.pypi.simple.v1+html", MEDIA_HTML),
+)
+
+_HTML_CHARSET = f"{MEDIA_TEXT_HTML}; charset=utf-8"
+
+
+@dataclass(frozen=True, slots=True)
+class Negotiated:
+    """The chosen representation and the exact media type to answer with."""
+
+    format: str
+    media_type: str
+
+
+def _best(items: list[tuple[str, float]], targets: tuple[tuple[str, str, str], ...]) -> tuple[float, int, str]:
+    """Best ``(quality, specificity, response media type)`` across ``targets``."""
+    best: tuple[float, int, str] = (-1.0, 0, "")
     for media, quality in items:
-        specificity = _specificity(media, type_, subtype)
-        if specificity and (quality, specificity) > best:
-            best = (quality, specificity)
+        for type_, subtype, response in targets:
+            specificity = _specificity(media, type_, subtype)
+            if specificity and (quality, specificity) > best[:2]:
+                best = (quality, specificity, response)
     return best
 
 
-def preferred_format(accept: str | None) -> str:
-    """Choose between the JSON and HTML Simple API representations."""
-    if not accept:
-        return _FORMAT_HTML
-    items = _accept_items(accept)
+def negotiate(accept: str | None) -> Negotiated:
+    """Pick a representation and the media type to answer with.
+
+    PEP 691 ties the response media type to what the client asked for. Answering a
+    browser with the vendor HTML type makes it download the index as a file, so
+    ``text/html`` requests get ``text/html`` back.
+    """
+    items = _accept_items(accept) if accept else []
     if not items:
-        return _FORMAT_HTML
+        return Negotiated(_FORMAT_HTML, _HTML_CHARSET)
 
-    json_best = max(
-        _best_match(items, "application", "vnd.pypi.simple.v1+json"),
-        _best_match(items, "application", "json"),
-    )
-    html_best = max(
-        _best_match(items, "application", "vnd.pypi.simple.v1+html"),
-        _best_match(items, "text", "html"),
-    )
-    if json_best[0] < 0:
-        return _FORMAT_HTML
-    if json_best > html_best:
-        return _FORMAT_JSON
-    return _FORMAT_HTML
+    json_quality, json_specificity, json_media = _best(items, _JSON_TARGETS)
+    html_quality, html_specificity, html_media = _best(items, _HTML_TARGETS)
 
-
-def media_type_for_format(fmt: str) -> str:
-    return MEDIA_JSON if fmt == _FORMAT_JSON else MEDIA_HTML
+    if json_media and (
+        json_quality > html_quality or (json_quality == html_quality and json_specificity > html_specificity)
+    ):
+        return Negotiated(_FORMAT_JSON, json_media)
+    if html_media:
+        return Negotiated(_FORMAT_HTML, f"{html_media}; charset=utf-8")
+    # Nothing recognised (for example "Accept: image/png"): stay browser friendly.
+    return Negotiated(_FORMAT_HTML, _HTML_CHARSET)
 
 
 # --------------------------------------------------------------------------- #
