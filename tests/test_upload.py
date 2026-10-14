@@ -6,7 +6,14 @@ from dataclasses import replace
 
 from fastapi.testclient import TestClient
 
-from conftest import ADMIN_USERNAME, build_wheel, parse_credentials, wheel_filename
+from conftest import (
+    ADMIN_USERNAME,
+    build_sdist,
+    build_wheel,
+    parse_credentials,
+    sdist_filename,
+    wheel_filename,
+)
 from pypiswasta.app import create_app
 from pypiswasta.config import (
     Config,
@@ -160,10 +167,22 @@ def test_replacement_honours_overwrite_flag(tmp_path) -> None:
         assert conflict.status_code == 409
 
 
-def test_rejects_sdists(instance) -> None:
-    response = instance.upload(b"not a wheel", "demo-1.0.0.tar.gz")
+def test_rejects_unsupported_archive_formats(instance) -> None:
+    """PEP 625 defines only ``.tar.gz`` sdists, so a ``.zip`` is not accepted."""
+    response = instance.upload(b"not a wheel", "demo-1.0.0.zip")
     assert response.status_code == 400
-    assert "wheel" in response.json()["detail"]
+    assert "tar.gz" in response.json()["detail"]
+
+
+def test_rejects_filetype_that_contradicts_the_filename(instance) -> None:
+    """The filename decides the format; a client cannot declare a different one."""
+    response = instance.upload(
+        build_sdist("demo", "1.0.0"),
+        sdist_filename("demo", "1.0.0"),
+        form={"filetype": "bdist_wheel"},
+    )
+    assert response.status_code == 400
+    assert "filetype" in response.json()["detail"]
 
 
 def test_rejects_mismatched_form_fields(instance) -> None:

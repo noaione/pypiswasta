@@ -15,9 +15,17 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+from packaging.utils import canonicalize_name
+
+SCHEMA_VERSION = 2
 
 ROLES = ("admin", "upload", "reader")
+
+# Distribution kinds stored in ``artifacts.packagetype``. These mirror the values
+# twine sends in its ``filetype`` upload field.
+PACKAGETYPE_WHEEL = "bdist_wheel"
+PACKAGETYPE_SDIST = "sdist"
+PACKAGETYPES = (PACKAGETYPE_WHEEL, PACKAGETYPE_SDIST)
 
 ALGORITHM_ARGON2ID = "argon2id"
 ALGORITHM_SHA256_DOMAIN = "sha256-domain-v1"
@@ -58,7 +66,39 @@ CREATE TABLE IF NOT EXISTS credentials (
 );
 """
 
-MIGRATIONS: tuple[tuple[int, str], ...] = ((1, _SCHEMA_V1),)
+# v2 adds source distributions (``artifacts.packagetype``) and API tokens.
+#
+# ``packagetype`` is added with ``ALTER TABLE`` instead of recreating the table:
+# existing deployments hold real artifact rows, and a table rewrite would risk
+# them. SQLite permits ``ADD COLUMN`` with ``NOT NULL`` and ``CHECK`` provided a
+# non-null default is given, and that default keeps every existing row valid.
+_SCHEMA_V2 = """
+ALTER TABLE artifacts ADD COLUMN packagetype TEXT NOT NULL DEFAULT 'bdist_wheel'
+    CHECK (packagetype IN ('bdist_wheel', 'sdist'));
+
+CREATE TABLE IF NOT EXISTS tokens (
+    id            INTEGER PRIMARY KEY,
+    name          TEXT NOT NULL UNIQUE, -- doubles as the HTTP Basic username
+    role          TEXT NOT NULL CHECK (role IN ('admin', 'upload', 'reader')),
+    algorithm     TEXT NOT NULL CHECK (algorithm IN ('argon2id', 'sha256-domain-v1')),
+    password_hash TEXT NOT NULL,
+    hint          TEXT NOT NULL, -- e.g. "pypisw_9f3c…a1b2"; shown by `token list`
+    created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+MIGRATIONS: tuple[tuple[int, str], ...] = ((1, _SCHEMA_V1), (2, _SCHEMA_V2))
+
+
+def _like_pattern(query: str) -> str:
+    """A substring ``LIKE`` pattern for a project name.
+
+    ``canonicalize_name`` normalizes ``-``/``_``/``.`` but leaves the ``LIKE``
+    wildcards alone, so ``%`` and ``_`` must be escaped here or a search for
+    ``100%`` would match every project.
+    """
+    escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
 
 
 class Database:
@@ -162,35 +202,79 @@ class Database:
         cursor = conn.execute("DELETE FROM packages WHERE name = ?", (name,))
         return cursor.rowcount > 0
 
-    def list_projects(self, *, visibility: str | None = None) -> list[sqlite3.Row]:
+    def list_projects(self, *, visibility: str | None = None, query: str | None = None) -> list[sqlite3.Row]:
         """List projects ordered by name.
 
         ``visibility='public'`` returns only public projects, ``'private'`` only
-        private ones, ``None`` returns everything.
+        private ones, ``None`` returns everything. ``query`` filters by a
+        case-insensitive substring of the normalized name.
         """
-        sql = "SELECT * FROM packages"
-        params: list[object] = []
-        if visibility == "public":
-            sql += " WHERE private = 0"
-        elif visibility == "private":
-            sql += " WHERE private = 1"
-        sql += " ORDER BY name"
-        return list(self.conn.execute(sql, params).fetchall())
+        return self._select_projects(visibility=visibility, query=query, installable_only=False)
 
-    def list_installable_projects(self, *, visibility: str | None = None) -> list[sqlite3.Row]:
+    def list_installable_projects(
+        self,
+        *,
+        visibility: str | None = None,
+        query: str | None = None,
+    ) -> list[sqlite3.Row]:
         """Like :meth:`list_projects`, but only projects with at least one artifact.
 
         A project can temporarily have zero artifacts after every file is
         deleted. Such projects are omitted from the index listings and their
-        project pages answer ``404`` until a wheel is published again.
+        project pages answer ``404`` until a distribution is published again.
         """
-        sql = "SELECT p.* FROM packages p WHERE EXISTS (SELECT 1 FROM artifacts a WHERE a.package_id = p.id)"
+        return self._select_projects(visibility=visibility, query=query, installable_only=True)
+
+    def search_installable_projects(self, *, query: str, include_private: bool) -> list[sqlite3.Row]:
+        """Projects with at least one file whose name matches ``query``.
+
+        Returns ``name``, ``private`` and ``file_count`` per row. The count is
+        part of the same statement so a broad search does not turn into one
+        extra query per result.
+        """
+        conditions: list[str] = []
+        params: list[object] = []
+        if not include_private:
+            conditions.append("p.private = 0")
+        normalized = canonicalize_name(query or "")
+        if normalized:
+            conditions.append("p.name LIKE ? ESCAPE '\\'")
+            params.append(_like_pattern(normalized))
+
+        sql = (
+            "SELECT p.name AS name, p.private AS private, COUNT(a.id) AS file_count"
+            " FROM packages p JOIN artifacts a ON a.package_id = p.id"
+        )
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " GROUP BY p.id ORDER BY p.name"
+        return list(self.conn.execute(sql, params).fetchall())
+
+    def _select_projects(
+        self,
+        *,
+        visibility: str | None,
+        query: str | None,
+        installable_only: bool,
+    ) -> list[sqlite3.Row]:
+        conditions: list[str] = []
+        params: list[object] = []
+        if installable_only:
+            conditions.append("EXISTS (SELECT 1 FROM artifacts a WHERE a.package_id = p.id)")
         if visibility == "public":
-            sql += " AND p.private = 0"
+            conditions.append("p.private = 0")
         elif visibility == "private":
-            sql += " AND p.private = 1"
+            conditions.append("p.private = 1")
+        normalized = canonicalize_name(query or "")
+        if normalized:
+            conditions.append("p.name LIKE ? ESCAPE '\\'")
+            params.append(_like_pattern(normalized))
+
+        sql = "SELECT p.* FROM packages p"
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY p.name"
-        return list(self.conn.execute(sql).fetchall())
+        return list(self.conn.execute(sql, params).fetchall())
 
     # -- artifacts ------------------------------------------------------------
 
@@ -228,19 +312,21 @@ class Database:
         metadata_sha256: str,
         size: int,
         requires_python: str | None,
+        packagetype: str = PACKAGETYPE_WHEEL,
     ) -> None:
         conn.execute(
             """
             INSERT INTO artifacts (
                 package_id, filename, version, sha256, metadata_sha256, size,
-                requires_python
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                requires_python, packagetype
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(package_id, filename) DO UPDATE SET
                 version = excluded.version,
                 sha256 = excluded.sha256,
                 metadata_sha256 = excluded.metadata_sha256,
                 size = excluded.size,
                 requires_python = excluded.requires_python,
+                packagetype = excluded.packagetype,
                 uploaded_at = CURRENT_TIMESTAMP,
                 replaced_at = CASE
                     WHEN artifacts.sha256 <> excluded.sha256
@@ -256,6 +342,7 @@ class Database:
                 metadata_sha256,
                 size,
                 requires_python,
+                packagetype,
             ),
         )
 
@@ -312,3 +399,41 @@ class Database:
     def is_initialized(self) -> bool:
         row = self.conn.execute("SELECT COUNT(*) AS n FROM credentials WHERE role = 'admin'").fetchone()
         return int(row["n"]) > 0
+
+    # -- tokens ---------------------------------------------------------------
+
+    def list_tokens(self) -> list[sqlite3.Row]:
+        return list(self.conn.execute("SELECT * FROM tokens ORDER BY name").fetchall())
+
+    def get_token(self, name: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM tokens WHERE name = ?", (name,)).fetchone()
+
+    def insert_token(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        name: str,
+        role: str,
+        algorithm: str,
+        password_hash: str,
+        hint: str,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO tokens (name, role, algorithm, password_hash, hint) VALUES (?, ?, ?, ?, ?)",
+            (name, role, algorithm, password_hash, hint),
+        )
+
+    def delete_token(self, conn: sqlite3.Connection, name: str) -> bool:
+        cursor = conn.execute("DELETE FROM tokens WHERE name = ?", (name,))
+        return cursor.rowcount > 0
+
+    def usernames_in_use(self) -> set[str]:
+        """Every HTTP Basic username currently claimed, across both tables.
+
+        A token name shares the username namespace with the role credentials,
+        so ``token create`` has to refuse a name that is already taken -- a
+        duplicate would make the in-memory snapshot ambiguous.
+        """
+        names = {row["username"] for row in self.conn.execute("SELECT username FROM credentials").fetchall()}
+        names.update(row["name"] for row in self.conn.execute("SELECT name FROM tokens").fetchall())
+        return names

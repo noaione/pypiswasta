@@ -22,9 +22,12 @@ from . import __version__
 from .auth import (
     DEFAULT_USERNAMES,
     MIN_PASSWORD_LENGTH,
+    TOKEN_SENTINEL,
     UsernameError,
     build_credential,
     generate_credential,
+    generate_token_secret,
+    token_hint,
     validate_username,
 )
 from .config import (
@@ -36,12 +39,19 @@ from .config import (
     render_config,
     write_config_atomic,
 )
-from .db import ALGORITHM_ARGON2ID, ROLES, Database
+from .db import ALGORITHM_ARGON2ID, ALGORITHM_SHA256_DOMAIN, ROLES, Database
 from .storage import METADATA as METADATA_KIND
 from .storage import OBJECT as OBJECT_KIND
 from .storage import ObjectStore
 
 DEFAULT_DATA_DIR = "/var/lib/pypiswasta"
+
+# Credentials are loaded into an in-memory snapshot at startup, so any command
+# that changes them needs the service restarted (there is no SIGHUP reload).
+_RESTART_HINT = (
+    "restart the PyPISwasta service to make this take effect; credentials are "
+    "cached in memory and the database is only read at startup"
+)
 
 
 def _open_db(config: Config) -> Database:
@@ -174,6 +184,16 @@ def _cmd_auth_set_username(args: argparse.Namespace) -> int:
         print(f"{role} username is already {username}")
         return 0
 
+    # Token names live in the same username namespace, so a collision here would
+    # make the in-memory snapshot ambiguous. The credentials table only guards
+    # against other role usernames, hence the explicit check.
+    if username in database.usernames_in_use():
+        print(
+            f"error: username {username!r} is already used by another credential or token",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         with database.write() as conn:
             database.upsert_credential(
@@ -225,6 +245,76 @@ def _cmd_auth_set_admin_password(args: argparse.Namespace) -> int:
             password_hash=credential.password_hash,
         )
     print("admin password updated")
+    return 0
+
+
+def _cmd_token_create(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    database = _open_db(config)
+
+    try:
+        name = validate_username(args.name)
+    except UsernameError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if name == TOKEN_SENTINEL:
+        print(
+            f"error: {TOKEN_SENTINEL!r} is reserved for presenting a token as the password",
+            file=sys.stderr,
+        )
+        return 1
+    if name in database.usernames_in_use():
+        print(
+            f"error: {name!r} is already used by another credential or token",
+            file=sys.stderr,
+        )
+        return 1
+
+    secret = generate_token_secret()
+    credential = build_credential(args.role, name, secret, algorithm=ALGORITHM_SHA256_DOMAIN)
+    with database.write() as conn:
+        database.insert_token(
+            conn,
+            name=credential.username,
+            role=credential.role,
+            algorithm=credential.algorithm,
+            password_hash=credential.password_hash,
+            hint=token_hint(secret),
+        )
+
+    print(f"created token {name!r} with the {credential.role} role")
+    print(f"token:   {secret}")
+    print(f"summary: {token_hint(secret)}")
+    print()
+    print(f"username: {name}  (or {TOKEN_SENTINEL})")
+    print("password: the token above")
+    print("store it now; it is not written to disk or logged in plaintext")
+    print(_RESTART_HINT)
+    return 0
+
+
+def _cmd_token_list(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    database = _open_db(config)
+    rows = database.list_tokens()
+    if not rows:
+        print("no tokens")
+        return 0
+    for row in rows:
+        print(f"{row['name']}\t{row['role']}\t{row['hint']}\t{row['created_at']}")
+    return 0
+
+
+def _cmd_token_remove(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    database = _open_db(config)
+    with database.write() as conn:
+        removed = database.delete_token(conn, args.name)
+    if not removed:
+        print(f"error: unknown token: {args.name}", file=sys.stderr)
+        return 1
+    print(f"removed token {args.name}")
+    print(_RESTART_HINT)
     return 0
 
 
@@ -383,6 +473,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="set the administrator password interactively",
     )
     auth_admin.set_defaults(handler=_cmd_auth_set_admin_password)
+
+    token = subparsers.add_parser("token", help="manage API tokens")
+    token_sub = token.add_subparsers(dest="token_command")
+
+    token_create = token_sub.add_parser(
+        "create",
+        parents=[common],
+        help="create a token and print it exactly once",
+    )
+    token_create.add_argument("name", help="token name; also its HTTP Basic username")
+    token_create.add_argument(
+        "--role",
+        choices=ROLES,
+        default="upload",
+        help="capability the token carries (default: %(default)s)",
+    )
+    token_create.set_defaults(handler=_cmd_token_create)
+
+    token_list = token_sub.add_parser(
+        "list",
+        parents=[common],
+        help="list tokens with a recognisable summary of each secret",
+    )
+    token_list.set_defaults(handler=_cmd_token_list)
+
+    token_remove = token_sub.add_parser("remove", parents=[common], help="delete a token")
+    token_remove.add_argument("name")
+    token_remove.set_defaults(handler=_cmd_token_remove)
 
     package = subparsers.add_parser("package", help="inspect and manage projects")
     package_sub = package.add_subparsers(dest="package_command")

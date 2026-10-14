@@ -27,23 +27,25 @@ from .auth import (
     Credential,
     UsernameError,
     generate_credential,
+    optional_reader,
     require_admin,
     require_reader,
     require_upload,
     validate_username,
 )
 from .config import DEFAULT_CONFIG_PATH, Config, load_config
-from .db import Database
+from .db import PACKAGETYPE_SDIST, PACKAGETYPE_WHEEL, Database
+from .distributions import (
+    DistributionError,
+    UploadTooLargeError,
+    distribution_kind,
+    stage_upload,
+)
+from .sdists import inspect_sdist, parse_sdist_filename_strict
 from .storage import METADATA as METADATA_KIND
 from .storage import OBJECT as OBJECT_KIND
 from .storage import DigestError, ObjectStore, validate_digest
-from .wheels import (
-    UploadTooLargeError,
-    WheelError,
-    inspect_wheel,
-    parse_wheel_filename_strict,
-    stage_upload,
-)
+from .wheels import inspect_wheel, parse_wheel_filename_strict
 
 CONFIG_ENV_VAR = "PYPISWASTA_CONFIG"
 
@@ -129,8 +131,8 @@ def create_app(config_path: str | Path | None = None) -> FastAPI:
 
     app.add_middleware(SetupGateMiddleware)
 
-    @app.exception_handler(WheelError)
-    async def _wheel_error_handler(request: Request, exc: WheelError) -> Response:
+    @app.exception_handler(DistributionError)
+    async def _distribution_error_handler(request: Request, exc: DistributionError) -> Response:
         return JSONResponse({"detail": str(exc)}, status_code=400)
 
     _install_routes(app)
@@ -153,6 +155,16 @@ def _not_found() -> HTTPException:
 
 def _normalize_name(raw: str) -> str:
     return canonicalize_name(unquote(raw))
+
+
+def _parse_filename_strict(filename: str) -> tuple[str, str]:
+    """Validate ``filename`` as whichever distribution format it claims to be."""
+    kind = distribution_kind(filename)
+    if kind == PACKAGETYPE_WHEEL:
+        return parse_wheel_filename_strict(filename)
+    if kind == PACKAGETYPE_SDIST:
+        return parse_sdist_filename_strict(filename)
+    raise DistributionError("only wheels (.whl) and .tar.gz source distributions are accepted")
 
 
 def _file_entries(artifacts, *, prefix: str) -> list[simple.FileEntry]:
@@ -246,6 +258,31 @@ def _install_routes(app: FastAPI) -> None:
     @app.api_route("/private/simple/{name}", methods=["GET", "HEAD"], include_in_schema=False)
     def private_simple_project_redirect(request: Request, name: str) -> Response:
         return permalink(request)
+
+    # -- catalog search ------------------------------------------------------
+
+    @app.api_route("/search", methods=["GET", "HEAD"])
+    def search(request: Request) -> Response:
+        config, database, _, _ = _state(request)
+        # A browser gets the public catalog; a caller that presents reader
+        # credentials (or better) also sees private projects.
+        credential = optional_reader(request)
+        query = (request.query_params.get("q") or "").strip()
+
+        results: list[tuple[str, bool, int]] = []
+        if query:
+            rows = database.search_installable_projects(
+                query=query,
+                include_private=credential is not None,
+            )
+            results = [(row["name"], bool(row["private"]), int(row["file_count"])) for row in rows]
+
+        return web.search_page(
+            branding=config.branding,
+            query=query,
+            results=results,
+            authenticated=credential is not None,
+        )
 
     # -- first-time setup ----------------------------------------------------
 
@@ -353,15 +390,13 @@ def _install_routes(app: FastAPI) -> None:
     @app.get("/api/admin/packages")
     def admin_list_packages(request: Request, credential: AdminCredential) -> JSONResponse:
         _, database, _, _ = _state(request)
-        query = (request.query_params.get("q") or "").strip().lower()
+        query = (request.query_params.get("q") or "").strip()
         visibility = request.query_params.get("visibility")
         if visibility not in (None, "public", "private"):
             raise HTTPException(status_code=400, detail="invalid visibility filter")
 
         packages = []
-        for row in database.list_projects(visibility=visibility):
-            if query and query not in row["name"]:
-                continue
+        for row in database.list_projects(visibility=visibility, query=query or None):
             artifacts = database.list_artifacts(row["id"])
             packages.append({
                 "name": row["name"],
@@ -376,6 +411,7 @@ def _install_routes(app: FastAPI) -> None:
                         "metadata_sha256": artifact["metadata_sha256"],
                         "size": artifact["size"],
                         "requires_python": artifact["requires_python"],
+                        "packagetype": artifact["packagetype"],
                         "uploaded_at": artifact["uploaded_at"],
                         "replaced_at": artifact["replaced_at"],
                     }
@@ -584,12 +620,23 @@ async def _handle_upload(request: Request) -> Response:
     if not filename:
         raise HTTPException(status_code=400, detail="upload has no filename")
 
-    expected_name, expected_version = parse_wheel_filename_strict(filename)
+    expected_name, expected_version = _parse_filename_strict(filename)
+
+    # The filename decides the format; a client that declares something else is
+    # contradicting itself, and the filename is what installers will parse.
+    declared_type = form.get("filetype")
+    if isinstance(declared_type, str) and declared_type.strip():
+        actual_type = distribution_kind(filename)
+        if declared_type.strip() != actual_type:
+            raise HTTPException(
+                status_code=400,
+                detail=f"form 'filetype' is {declared_type.strip()!r} but the filename is a {actual_type}",
+            )
 
     form_name = form.get("name")
     if isinstance(form_name, str) and form_name.strip():
         if canonicalize_name(form_name) != expected_name:
-            raise HTTPException(status_code=400, detail="form 'name' does not match the wheel filename")
+            raise HTTPException(status_code=400, detail="form 'name' does not match the distribution filename")
     form_version = form.get("version")
     if isinstance(form_version, str) and form_version.strip():
         try:
@@ -599,7 +646,7 @@ async def _handle_upload(request: Request) -> Response:
         if not matches:
             raise HTTPException(
                 status_code=400,
-                detail="form 'version' does not match the wheel filename",
+                detail="form 'version' does not match the distribution filename",
             )
 
     chunk_size = config.performance.upload_chunk_size_kb * 1024
@@ -613,7 +660,7 @@ async def _handle_upload(request: Request) -> Response:
         staged, digest, size = await anyio.to_thread.run_sync(_stage)
     except UploadTooLargeError as exc:
         raise HTTPException(status_code=413, detail=str(exc)) from exc
-    except WheelError as exc:
+    except DistributionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # Clients may declare the digest they expect; a mismatch is a hard error.
@@ -627,7 +674,10 @@ async def _handle_upload(request: Request) -> Response:
             )
 
     try:
-        info = await anyio.to_thread.run_sync(lambda: inspect_wheel(staged, filename))
+        if distribution_kind(filename) == PACKAGETYPE_SDIST:
+            info = await anyio.to_thread.run_sync(lambda: inspect_sdist(staged, filename))
+        else:
+            info = await anyio.to_thread.run_sync(lambda: inspect_wheel(staged, filename))
     except BaseException:
         store.discard(staged)
         raise
@@ -671,6 +721,7 @@ async def _handle_upload(request: Request) -> Response:
                 metadata_sha256=metadata_digest,
                 size=size,
                 requires_python=info.requires_python,
+                packagetype=info.packagetype,
             )
             database.touch_package(conn, package_id)
     finally:

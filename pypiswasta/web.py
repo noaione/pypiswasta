@@ -66,7 +66,7 @@ th, td { text-align: left; padding: .5rem .55rem; border-bottom: 1px solid var(-
 th { color: var(--muted); font-weight: 600; font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }
 .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.1rem; margin: 1rem 0; }
 label { display: block; font-weight: 600; margin: 1rem 0 .3rem; }
-input[type=text], input[type=password] {
+input[type=text], input[type=password], input[type=search] {
   width: 100%; padding: .5rem .6rem; border: 1px solid var(--border);
   border-radius: 6px; background: var(--bg); color: var(--fg); font: inherit;
 }
@@ -166,11 +166,13 @@ def landing_page(*, branding: BrandingConfig, initialized: bool, package_count: 
   <pre>public:  /simple/
 private: /private/simple/</pre>
 </div>
+{search_form()}
 <h2>Endpoints</h2>
 <ul>
   <li><a href="/simple/">/simple/</a> &mdash; public project index (HTML or JSON)</li>
   <li><a href="/private/simple/">/private/simple/</a> &mdash; all projects (reader credentials)</li>
-  <li><code>POST /legacy/</code> &mdash; upload a wheel (upload credentials)</li>
+  <li><a href="/search">/search</a> &mdash; find a project by name</li>
+  <li><code>POST /legacy/</code> &mdash; upload a wheel or sdist (upload credentials)</li>
   <li><code>GET /api/admin/packages</code> &mdash; admin package listing</li>
   <li><a href="/healthz">/healthz</a></li>
 </ul>"""
@@ -239,3 +241,60 @@ def error_page(*, branding: BrandingConfig, status_code: int, message: str) -> H
 <p class="error">{esc(message)}</p>
 <p class="muted"><a href="/">Return to the index</a></p>"""
     return page_response(branding=branding, title=str(status_code), body=body, status_code=status_code)
+
+
+def project_url(name: str, *, private: bool = False) -> str:
+    """Path of a project's index page, in its own (public or private) namespace."""
+    prefix = "/private" if private else ""
+    return f"{prefix}/simple/{esc(name)}/"
+
+
+def search_form(query: str = "") -> str:
+    """The GET search form, shared by the landing and search pages."""
+    return f"""<form method="get" action="/search" role="search">
+  <label for="q">Search projects</label>
+  <input type="search" id="q" name="q" value="{esc(query)}" spellcheck="false" autocomplete="off">
+  <button type="submit">Search</button>
+</form>"""
+
+
+def search_page(
+    *,
+    branding: BrandingConfig,
+    query: str,
+    results: list[tuple[str, bool, int]],
+    authenticated: bool,
+) -> HTMLResponse:
+    """Search results; ``results`` is ``(name, private, file_count)`` per match."""
+    if results:
+        rows = "\n".join(
+            "<tr>"
+            f'<td><a href="{project_url(name, private=private)}">{esc(name)}</a></td>'
+            f"<td>{'private' if private else 'public'}</td>"
+            f"<td>{count}</td>"
+            "</tr>"
+            for name, private, count in results
+        )
+        outcome = f"""<p class="muted">{len(results)} match(es) for &ldquo;{esc(query)}&rdquo;.</p>
+<table>
+  <thead><tr><th>Project</th><th>Visibility</th><th>Files</th></tr></thead>
+  <tbody>
+{rows}
+  </tbody>
+</table>"""
+    elif query:
+        outcome = f'<p class="muted">No project matches &ldquo;{esc(query)}&rdquo;.</p>'
+    else:
+        outcome = '<p class="muted">Enter part of a project name to search.</p>'
+
+    scope_note = (
+        '<p class="muted">You are authenticated, so private projects are included.</p>'
+        if authenticated
+        else '<p class="muted">Showing public projects only. Send reader credentials to include private ones.</p>'
+    )
+    body = f"""<h1>Search</h1>
+{search_form(query)}
+{outcome}
+{scope_note}
+<p class="muted"><a href="/">Back to the index</a></p>"""
+    return page_response(branding=branding, title="Search", body=body)

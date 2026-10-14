@@ -1,57 +1,64 @@
-"""Wheel validation, core-metadata extraction and upload staging.
+"""Wheel (``.whl``) validation and core-metadata extraction.
 
-Only wheels are accepted. An uploaded archive is checked for structural
-problems (bad ZIP, path traversal, duplicate or encrypted members, absurd
-member counts, oversized metadata) before any of it is trusted.
+An uploaded wheel is checked for structural problems (bad ZIP, path traversal,
+duplicate or encrypted members, absurd member counts, oversized metadata) before
+any of it is trusted. Source distributions are handled by
+:mod:`pypiswasta.sdists`; the parts shared by both live in
+:mod:`pypiswasta.distributions`.
 """
 
 from __future__ import annotations
 
 import email.message
-import hashlib
-import os
 import zipfile
 import zlib
-from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO
 
 from packaging.utils import canonicalize_name, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 
-from .storage import ObjectStore
+from .db import PACKAGETYPE_WHEEL
+from .distributions import (
+    WHEEL_EXTENSION,
+    DistributionError,
+    DistributionInfo,
+    UploadTooLargeError,
+    reject_unsafe_filename,
+    stage_upload,
+)
+
+__all__ = [
+    "METADATA_SUFFIX",
+    "WHEEL_EXTENSION",
+    "DistributionError",
+    "UploadTooLargeError",
+    "WheelError",
+    "WheelInfo",
+    "inspect_wheel",
+    "parse_wheel_filename_strict",
+    "stage_upload",
+]
 
 MAX_MEMBERS = 20_000
 MAX_METADATA_BYTES = 8 * 1024 * 1024
 
-WHEEL_EXTENSION = ".whl"
 METADATA_SUFFIX = ".dist-info/METADATA"
 
 
-class WheelError(ValueError):
+class WheelError(DistributionError):
     """Raised when an uploaded distribution is not an acceptable wheel."""
 
 
-class UploadTooLargeError(WheelError):
-    """Raised when an upload exceeds the configured maximum size."""
-
-
-@dataclass(frozen=True, slots=True)
-class WheelInfo:
-    name: str  # normalized PEP 503 name
-    version: str  # normalized version
-    requires_python: str | None
-    metadata_bytes: bytes
+# Retained as the name of the record returned by :func:`inspect_wheel`; wheels
+# and sdists share one shape, discriminated by ``packagetype``.
+WheelInfo = DistributionInfo
 
 
 def parse_wheel_filename_strict(filename: str) -> tuple[str, str]:
     """Validate a wheel filename and return ``(normalized_name, version)``."""
-    if not filename or "\x00" in filename:
-        raise WheelError("invalid filename")
-    if "/" in filename or "\\" in filename:
-        raise WheelError("filename must not contain directory components")
+    reject_unsafe_filename(filename, WheelError)
     if not filename.endswith(WHEEL_EXTENSION):
-        raise WheelError("only wheel files (.whl) are accepted; sdists are rejected")
+        raise WheelError("not a wheel: expected a .whl file")
     try:
         name, version, _build, _tags = parse_wheel_filename(filename)
     except ValueError as exc:
@@ -164,43 +171,10 @@ def inspect_wheel(path: Path, filename: str) -> WheelInfo:
         raise WheelError(f"corrupt wheel archive: {exc}") from exc
 
     requires_python = _parse_core_metadata(metadata_bytes, name, version)
-    return WheelInfo(
+    return DistributionInfo(
         name=name,
         version=version,
         requires_python=requires_python,
         metadata_bytes=metadata_bytes,
+        packagetype=PACKAGETYPE_WHEEL,
     )
-
-
-def stage_upload(
-    source: BinaryIO,
-    store: ObjectStore,
-    *,
-    chunk_size: int,
-    max_bytes: int,
-) -> tuple[Path, str, int]:
-    """Stream ``source`` into staging while hashing.
-
-    Returns ``(staging_path, sha256_hexdigest, size)``. The staged file is left
-    on disk for the caller to validate and publish (or discard).
-    """
-    digest = hashlib.sha256()
-    size = 0
-    tmp_path = store.new_staging_path()
-    try:
-        with tmp_path.open("wb") as target:
-            while True:
-                chunk = source.read(chunk_size)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > max_bytes:
-                    raise UploadTooLargeError(f"upload exceeds the maximum size of {max_bytes} bytes")
-                digest.update(chunk)
-                target.write(chunk)
-            target.flush()
-            os.fsync(target.fileno())
-    except BaseException:
-        store.discard(tmp_path)
-        raise
-    return tmp_path, digest.hexdigest(), size

@@ -37,6 +37,15 @@ from . import db as db_module
 
 _DOMAIN_SEPARATOR = b"pypiswasta:password:v1:"
 
+# Tokens are machine credentials with their own name and their own role. They
+# share the HTTP Basic username namespace with the three role credentials.
+TOKEN_PREFIX = "pypisw_"  # ruff: ignore[hardcoded-password-string]
+
+#: Username that lets a client send a token as the *password*, mirroring PyPI.
+#: It exists so tooling that defaults to ``__token__`` -- the official GitHub
+#: Action does -- works without being reconfigured.
+TOKEN_SENTINEL = "__token__"  # ruff: ignore[hardcoded-password-string]
+
 # Roles are deliberately *not* a linear hierarchy: ``upload`` may publish but
 # must never read private projects, so every guard lists the roles it accepts.
 ALLOWED_ROLES: dict[str, frozenset[str]] = {
@@ -78,6 +87,23 @@ _hasher = PasswordHasher()
 def generate_password() -> str:
     """A 256-bit URL-safe secret (43 characters)."""
     return secrets.token_urlsafe(32)
+
+
+def generate_token_secret() -> str:
+    """A 256-bit token carrying a recognisable ``pypisw_`` prefix."""
+    return TOKEN_PREFIX + secrets.token_urlsafe(32)
+
+
+def token_hint(secret: str) -> str:
+    """A short, non-secret summary of a token: its head and its tail.
+
+    Stored alongside the digest so ``token list`` can show something an
+    operator recognises without the token being recoverable. Eight of the
+    forty-three random characters are revealed, which still leaves the
+    remainder far beyond guessing.
+    """
+    head = secret[: len(TOKEN_PREFIX) + 4]
+    return f"{head}…{secret[-4:]}"
 
 
 def fast_password_digest(role: str, password: str) -> str:
@@ -174,9 +200,10 @@ class AuthStore:
     def __init__(self) -> None:
         self._by_username: dict[str, Credential] = {}
         self._by_role: dict[str, Credential] = {}
+        self._tokens: tuple[Credential, ...] = ()
         self._initialized = False
 
-    def install(self, rows: Iterable[_RowLike]) -> None:
+    def install(self, rows: Iterable[_RowLike], tokens: Iterable[_RowLike] = ()) -> None:
         by_username: dict[str, Credential] = {}
         by_role: dict[str, Credential] = {}
         for row in rows:
@@ -191,13 +218,33 @@ class AuthStore:
             by_username[credential.username] = credential
             by_role[credential.role] = credential
 
+        # Tokens join the same username map, but deliberately not ``by_role``:
+        # a token must never displace the role credential that
+        # ``credential_for_role`` reports.
+        token_credentials: list[Credential] = []
+        for token_row in tokens:
+            credential = Credential(
+                role=token_row["role"],
+                username=token_row["name"],
+                algorithm=token_row["algorithm"],
+                password_hash=token_row["password_hash"],
+            )
+            if credential.username in by_username:
+                raise ValueError(f"token {credential.username!r} collides with another credential username")
+            by_username[credential.username] = credential
+            token_credentials.append(credential)
+
         # Atomic swap: a single attribute rebind is observed by other threads.
         self._by_username = by_username
         self._by_role = by_role
+        self._tokens = tuple(token_credentials)
         self._initialized = "admin" in by_role
 
     def reload(self, database: db_module.Database) -> None:
-        self.install(database.list_credentials())  # pyright: ignore[reportArgumentType]
+        self.install(
+            database.list_credentials(),  # pyright: ignore[reportArgumentType]
+            database.list_tokens(),  # pyright: ignore[reportArgumentType]
+        )
 
     @property
     def initialized(self) -> bool:
@@ -213,10 +260,26 @@ class AuthStore:
     def authenticate(self, username: str, password: str) -> Credential | None:
         credential = self._by_username.get(username)
         if credential is None:
+            # ``__token__`` carries no identity of its own, so the secret decides
+            # which token this is.
+            if username == TOKEN_SENTINEL:
+                return self._match_token(password)
             _burn_unknown_user_time(password)
             return None
         if verify_credential(credential, password):
             return credential
+        return None
+
+    def _match_token(self, password: str) -> Credential | None:
+        """Return the token whose secret is ``password``, if any.
+
+        A scan is affordable because tokens are few and verification is a single
+        SHA-256. It is also the only option: the store holds digests, so there is
+        no plaintext to index the lookup by.
+        """
+        for credential in self._tokens:
+            if verify_credential(credential, password):
+                return credential
         return None
 
 
@@ -287,3 +350,18 @@ def _require(capability: str):
 require_reader = _require("reader")
 require_upload = _require("upload")
 require_admin = _require("admin")
+
+
+def optional_reader(request: Request) -> Credential | None:
+    """Authenticate a reader *if* credentials are present, otherwise allow.
+
+    For pages that are useful anonymously but should reveal more to a trusted
+    caller. A credential that is present but wrong is still an error: quietly
+    treating a typo as anonymous would hide the mistake.
+    """
+    if not request.headers.get("authorization"):
+        return None
+    credential = _current_credential(request)
+    if credential.role not in ALLOWED_ROLES["reader"]:
+        raise forbidden()
+    return credential

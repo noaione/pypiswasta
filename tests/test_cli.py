@@ -265,7 +265,7 @@ def test_auth_set_username_validates_and_detects_collisions(tmp_path: Path, caps
 
     # Colliding with another role must fail cleanly instead of raising.
     assert main(["auth", "set-username", "upload", "reader", "--config", config]) == 1
-    assert "already used by another role" in capsys.readouterr().err
+    assert "already used by another credential or token" in capsys.readouterr().err
 
     # A rejected change leaves every stored credential untouched.
     assert main(["auth", "list", "--config", config]) == 0
