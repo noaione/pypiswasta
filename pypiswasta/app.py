@@ -77,12 +77,21 @@ class SetupGateMiddleware:
             await self.app(scope, receive, send)
             return
 
-        auth_store: AuthStore = scope["app"].state.auth
+        app = scope["app"]
+        auth_store: AuthStore = app.state.auth
+        path = scope["path"]
+
+        if not auth_store.initialized and path not in SETUP_EXEMPT_PATHS:
+            # This worker may have loaded its snapshot before another worker
+            # completed setup. Adopt the database's state rather than keeping
+            # the gate closed (which would keep serving /setup forever).
+            if app.state.database.is_initialized():
+                auth_store.reload(app.state.database)
+
         if auth_store.initialized:
             await self.app(scope, receive, send)
             return
 
-        path = scope["path"]
         if path in SETUP_EXEMPT_PATHS:
             await self.app(scope, receive, send)
             return
@@ -353,21 +362,34 @@ def _install_routes(app: FastAPI) -> None:
         taken.add(upload_name)
         reader_name = _unique_username(reader.username, taken)
 
+        created = False
         with database.write() as conn:
-            for role, role_username, credential in (
-                (admin.role, admin.username, admin),
-                (upload.role, upload_name, upload),
-                (reader.role, reader_name, reader),
-            ):
-                database.upsert_credential(
-                    conn,
-                    role=role,
-                    username=role_username,
-                    algorithm=credential.algorithm,
-                    password_hash=credential.password_hash,
-                )
+            # Re-check for an existing administrator *inside* the BEGIN IMMEDIATE
+            # transaction. A concurrent request (on this or another worker) may
+            # have completed setup while this request was awaiting its form body;
+            # only the first committed setup may create credentials, and the
+            # write lock makes the check and the insert atomic.
+            if not database.credential_exists(conn, "admin"):
+                for role, role_username, credential in (
+                    (admin.role, admin.username, admin),
+                    (upload.role, upload_name, upload),
+                    (reader.role, reader_name, reader),
+                ):
+                    database.upsert_credential(
+                        conn,
+                        role=role,
+                        username=role_username,
+                        algorithm=credential.algorithm,
+                        password_hash=credential.password_hash,
+                    )
+                created = True
 
         auth_store.reload(database)
+        if not created:
+            # Another request won the race; its credentials stand. This caller
+            # gets no secrets and is sent to the now-initialized application.
+            return RedirectResponse("/", status_code=303)
+
         return web.setup_result_page(
             branding=config.branding,
             credentials=[

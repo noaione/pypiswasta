@@ -449,9 +449,18 @@ class Database:
             (role, username, algorithm, password_hash),
         )
 
-    def is_initialized(self) -> bool:
-        row = self.conn.execute("SELECT COUNT(*) AS n FROM credentials WHERE role = 'admin'").fetchone()
+    def credential_exists(self, conn: sqlite3.Connection, role: str) -> bool:
+        """Whether a credential row for ``role`` exists, using ``conn``.
+
+        Taking the connection explicitly lets callers perform the check on the
+        same connection as the ``BEGIN IMMEDIATE`` transaction that would create
+        it, so the check and the write are serialized against other writers.
+        """
+        row = conn.execute("SELECT COUNT(*) AS n FROM credentials WHERE role = ?", (role,)).fetchone()
         return int(row["n"]) > 0
+
+    def is_initialized(self) -> bool:
+        return self.credential_exists(self.conn, "admin")
 
     # -- tokens ---------------------------------------------------------------
 
