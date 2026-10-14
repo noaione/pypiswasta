@@ -219,10 +219,11 @@ def _install_routes(app: FastAPI) -> None:
 
     @app.api_route("/", methods=["GET", "HEAD"])
     def landing(request: Request) -> HTMLResponse:
-        _, database, _, _ = _state(request)
+        config, database, _, _ = _state(request)
         projects = database.list_installable_projects()
         public = [row for row in projects if not row["private"]]
         return web.landing_page(
+            branding=config.branding,
             initialized=True,
             package_count=len(projects),
             public_count=len(public),
@@ -250,14 +251,14 @@ def _install_routes(app: FastAPI) -> None:
 
     @app.get("/setup")
     def setup_form(request: Request) -> Response:
-        _, _, _, auth_store = _state(request)
+        config, _, _, auth_store = _state(request)
         if auth_store.initialized:
             return RedirectResponse("/", status_code=303)
-        return web.setup_page()
+        return web.setup_page(branding=config.branding)
 
     @app.post("/setup")
     async def setup_submit(request: Request) -> Response:
-        _, database, _, auth_store = _state(request)
+        config, database, _, auth_store = _state(request)
         if auth_store.initialized:
             return RedirectResponse("/", status_code=303)
 
@@ -266,7 +267,11 @@ def _install_routes(app: FastAPI) -> None:
         try:
             username = validate_username(raw_username)
         except UsernameError as exc:
-            return web.setup_page(error=str(exc), username=raw_username or "admin")
+            return web.setup_page(
+                branding=config.branding,
+                error=str(exc),
+                username=raw_username or "admin",
+            )
 
         # No password is collected here: every credential is a freshly generated
         # 256-bit secret that is shown exactly once.
@@ -295,11 +300,12 @@ def _install_routes(app: FastAPI) -> None:
 
         auth_store.reload(database)
         return web.setup_result_page(
+            branding=config.branding,
             credentials=[
                 ("admin", admin.username, admin_password),
                 ("upload", upload_name, upload_password),
                 ("reader", reader_name, reader_password),
-            ]
+            ],
         )
 
     # -- Simple API ----------------------------------------------------------

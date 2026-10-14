@@ -1,7 +1,12 @@
 """Minimal HTML rendering for the human-facing pages.
 
-Deliberately small: a single stylesheet constant, a shell function, and a
-handful of page builders. No template engine, no gradients, no build step.
+Deliberately small: one stylesheet template, a shell function and a handful of
+page builders. No template engine, no gradients, no build step.
+
+Product identity comes from the ``[branding]`` configuration section, so a
+deployment can look like its own: the name appears in page titles, the index
+heading, the footer and the HTTP Basic realm, and the accent colours theme the
+stylesheet. Everything interpolated here is HTML-escaped.
 """
 
 from __future__ import annotations
@@ -10,7 +15,9 @@ import html
 
 from fastapi.responses import HTMLResponse
 
+from ._metadata import __name__ as PROJECT_NAME  # ruff: ignore[lowercase-imported-as-non-lowercase]
 from ._metadata import __version__
+from .config import BrandingConfig
 
 STYLESHEET = """
 :root {
@@ -20,7 +27,7 @@ STYLESHEET = """
   --bg: #ffffff;
   --panel: #f7f8fa;
   --border: #e3e6ea;
-  --accent: #2b5cd9;
+  --accent: __ACCENT__;
   --danger: #b3261e;
   --ok: #1a7f37;
 }
@@ -31,7 +38,7 @@ STYLESHEET = """
     --bg: #101216;
     --panel: #171a20;
     --border: #272c34;
-    --accent: #8ab4ff;
+    --accent: __ACCENT_DARK__;
     --danger: #ff8a80;
     --ok: #6ddc8a;
   }
@@ -80,27 +87,49 @@ def esc(value: object) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
 
+def stylesheet(branding: BrandingConfig) -> str:
+    """The page stylesheet with the configured accent colours substituted in."""
+    return STYLESHEET.replace("__ACCENT_DARK__", branding.accent_dark).replace("__ACCENT__", branding.accent)
+
+
+def footer_text(branding: BrandingConfig) -> str:
+    """The attribution line shown at the bottom of every page.
+
+    ``branding.footer`` is appended to the attribution as-is: it comes from the
+    operator's own configuration file rather than from a request, so it is
+    deliberately not escaped and may contain markup.
+    """
+    attribution = f"Powered with {esc(PROJECT_NAME)} v{__version__}"
+    if not branding.footer:
+        return attribution
+    return f"{attribution} · {branding.footer}"
+
+
 def render_page(
     *,
-    title: str,
+    branding: BrandingConfig,
     body: str,
+    title: str | None = None,
     description: str | None = None,
     footer: str | None = None,
 ) -> str:
-    meta_description = f'\n<meta name="description" content="{esc(description)}">' if description else ""
-    footer_html = f"\n<footer>{footer}</footer>" if footer else ""
+    """Wrap ``body`` in the shared shell, inside the centred container."""
+    page_title = branding.name if title is None else f"{title} — {branding.name}"
+    meta_description = f'\n<meta name="description" content="{esc(description or branding.tagline)}">'
+    footer_html = footer if footer is not None else footer_text(branding)
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">{meta_description}
 <meta name="robots" content="noindex">
-<title>{esc(title)}</title>
-<style>{STYLESHEET}</style>
+<title>{esc(page_title)}</title>
+<style>{stylesheet(branding)}</style>
 </head>
 <body>
 <main>
-{body}{footer_html}
+{body}
+<footer>{footer_html}</footer>
 </main>
 </body>
 </html>
@@ -109,24 +138,25 @@ def render_page(
 
 def page_response(
     *,
-    title: str,
+    branding: BrandingConfig,
     body: str,
+    title: str | None = None,
     status_code: int = 200,
     description: str | None = None,
     footer: str | None = None,
     headers: dict[str, str] | None = None,
 ) -> HTMLResponse:
     return HTMLResponse(
-        render_page(title=title, body=body, description=description, footer=footer),
+        render_page(branding=branding, body=body, title=title, description=description, footer=footer),
         status_code=status_code,
         headers=headers,
     )
 
 
-def landing_page(*, initialized: bool, package_count: int, public_count: int) -> HTMLResponse:
+def landing_page(*, branding: BrandingConfig, initialized: bool, package_count: int, public_count: int) -> HTMLResponse:
     if initialized:
-        body = f"""<h1>PyPISwasta</h1>
-<p class="muted">A minimal wheel-only Python package index.</p>
+        body = f"""<h1>{esc(branding.name)}</h1>
+<p class="muted">{esc(branding.tagline)}</p>
 <div class="card">
   <p><strong>{package_count}</strong> project(s) indexed, <strong>{public_count}</strong> public.</p>
   <p class="muted">Configure an installer with one of these indexes:</p>
@@ -141,16 +171,14 @@ private: /private/simple/</pre>
   <li><code>GET /api/admin/packages</code> &mdash; admin package listing</li>
   <li><a href="/healthz">/healthz</a></li>
 </ul>"""
-        footer = f"""Powered with PyPISwasta v{__version__}"""
     else:
-        body = """<h1>PyPISwasta</h1>
+        body = f"""<h1>{esc(branding.name)}</h1>
 <p class="muted">This instance has not been set up yet.</p>
 <div class="notice"><a href="/setup">Continue to first-time setup &rarr;</a></div>"""
-        footer = None
-    return page_response(title="PyPISwasta", body=body, footer=footer)
+    return page_response(branding=branding, body=body)
 
 
-def setup_page(*, error: str | None = None, username: str = "admin") -> HTMLResponse:
+def setup_page(*, branding: BrandingConfig, error: str | None = None, username: str = "admin") -> HTMLResponse:
     error_html = f'\n<p class="error">{esc(error)}</p>' if error else ""
     body = f"""<h1>First-time setup</h1>
 <p class="muted">Choose the administrator username. Until an administrator exists every
@@ -169,13 +197,14 @@ and shown exactly once on the next page.</p>
 <code>pypiswasta auth reset-password &lt;role&gt;</code>, or choose your own
 administrator password with <code>pypiswasta auth set-admin-password</code>.</p>"""
     return page_response(
-        title="First-time setup — PyPISwasta",
+        branding=branding,
+        title="First-time setup",
         body=body,
         headers={"Cache-Control": "no-store"},
     )
 
 
-def setup_result_page(*, credentials: list[tuple[str, str, str]]) -> HTMLResponse:
+def setup_result_page(*, branding: BrandingConfig, credentials: list[tuple[str, str, str]]) -> HTMLResponse:
     rows = "\n".join(
         f"<tr><td>{esc(role)}</td><td><code>{esc(username)}</code></td><td><code>{esc(password)}</code></td></tr>"
         for role, username, password in credentials
@@ -195,14 +224,15 @@ private index: /private/simple/
 upload:        POST /legacy/</pre>
 <p><a href="/">Continue to the index &rarr;</a></p>"""
     return page_response(
-        title="Setup complete — PyPISwasta",
+        branding=branding,
+        title="Setup complete",
         body=body,
         headers={"Cache-Control": "no-store"},
     )
 
 
-def error_page(*, status_code: int, message: str) -> HTMLResponse:
+def error_page(*, branding: BrandingConfig, status_code: int, message: str) -> HTMLResponse:
     body = f"""<h1>{status_code}</h1>
 <p class="error">{esc(message)}</p>
 <p class="muted"><a href="/">Return to the index</a></p>"""
-    return page_response(title=f"{status_code} — PyPISwasta", body=body, status_code=status_code)
+    return page_response(branding=branding, title=str(status_code), body=body, status_code=status_code)

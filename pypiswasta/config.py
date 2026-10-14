@@ -7,6 +7,7 @@ in the SQLite database and created through the first-time setup flow.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,17 @@ MIN_CHUNK_KB = 64
 MAX_CHUNK_KB = 16384
 MIN_BUSY_TIMEOUT_MS = 100
 MAX_BUSY_TIMEOUT_MS = 120000
+
+BRANDING_NAME_MAX = 64
+BRANDING_TAGLINE_MAX = 200
+BRANDING_FOOTER_MAX = 500
+
+DEFAULT_BRANDING_NAME = "PyPISwasta"
+DEFAULT_BRANDING_TAGLINE = "A minimal wheel-only Python package index."
+DEFAULT_ACCENT = "#2b5cd9"
+DEFAULT_ACCENT_DARK = "#8ab4ff"
+
+_HEX_COLOUR = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
 
 
 class ConfigError(Exception):
@@ -56,11 +68,32 @@ class PerformanceConfig:
 
 
 @dataclass(frozen=True)
+class BrandingConfig:
+    """Operator-visible identity, used by the HTML shell and the Basic realm."""
+
+    name: str = DEFAULT_BRANDING_NAME
+    tagline: str = DEFAULT_BRANDING_TAGLINE
+    #: Extra HTML appended to the footer of every page. This comes from the
+    #: operator's configuration file and is deliberately rendered without
+    #: escaping, so it may contain markup and links. Never user-supplied.
+    footer: str = ""
+    accent: str = DEFAULT_ACCENT
+    accent_dark: str = DEFAULT_ACCENT_DARK
+
+    @property
+    def realm(self) -> str:
+        """The name, made safe for a quoted ``WWW-Authenticate`` value."""
+        safe = "".join(char for char in self.name if char.isprintable() and char not in '"\\')
+        return safe or DEFAULT_BRANDING_NAME
+
+
+@dataclass(frozen=True)
 class Config:
     server: ServerConfig
     storage: StorageConfig
     repository: RepositoryConfig
     performance: PerformanceConfig
+    branding: BrandingConfig
     path: Path | None = None
 
 
@@ -171,6 +204,49 @@ def _parse_performance(table: dict[str, Any]) -> PerformanceConfig:
     return PerformanceConfig(upload_chunk_size_kb=chunk_kb, sqlite_busy_timeout_ms=busy_timeout_ms)
 
 
+def _toml_string(value: str) -> str:
+    """Render ``value`` as a quoted TOML basic string."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _parse_colour(table: dict[str, Any], key: str, default: str) -> str:
+    value = _str(table, key, default, "branding").strip()
+    if not _HEX_COLOUR.match(value):
+        raise ConfigError(f"branding.{key} must be a hex colour such as {DEFAULT_ACCENT}")
+    return value
+
+
+def _parse_branding(table: dict[str, Any]) -> BrandingConfig:
+    name = _str(table, "name", DEFAULT_BRANDING_NAME, "branding").strip()
+    if not name:
+        raise ConfigError("branding.name must not be empty")
+    if len(name) > BRANDING_NAME_MAX:
+        raise ConfigError(f"branding.name must be at most {BRANDING_NAME_MAX} characters")
+    if any(not char.isprintable() for char in name):
+        raise ConfigError("branding.name must not contain control characters")
+
+    tagline = _str(table, "tagline", DEFAULT_BRANDING_TAGLINE, "branding").strip()
+    if len(tagline) > BRANDING_TAGLINE_MAX:
+        raise ConfigError(f"branding.tagline must be at most {BRANDING_TAGLINE_MAX} characters")
+    if any(not char.isprintable() for char in tagline):
+        raise ConfigError("branding.tagline must not contain control characters")
+
+    footer = _str(table, "footer", "", "branding").strip()
+    if len(footer) > BRANDING_FOOTER_MAX:
+        raise ConfigError(f"branding.footer must be at most {BRANDING_FOOTER_MAX} characters")
+    if any(not char.isprintable() and char not in "\n\r\t" for char in footer):
+        raise ConfigError("branding.footer must not contain control characters")
+
+    return BrandingConfig(
+        name=name,
+        tagline=tagline,
+        footer=footer,
+        accent=_parse_colour(table, "accent", DEFAULT_ACCENT),
+        accent_dark=_parse_colour(table, "accent_dark", DEFAULT_ACCENT_DARK),
+    )
+
+
 def parse_config(data: dict[str, Any], *, path: Path | None = None) -> Config:
     """Validate an already-parsed TOML mapping into a :class:`Config`."""
     if "authentication" in data:
@@ -184,6 +260,7 @@ def parse_config(data: dict[str, Any], *, path: Path | None = None) -> Config:
         storage=_parse_storage(_as_table(data, "storage")),
         repository=_parse_repository(_as_table(data, "repository")),
         performance=_parse_performance(_as_table(data, "performance")),
+        branding=_parse_branding(_as_table(data, "branding")),
         path=path,
     )
 
@@ -220,13 +297,13 @@ def render_config(config: Config) -> str:
 # endpoint answers with a redirect (or 503) until setup completes.
 
 [server]
-host = "{config.server.host}"
+host = {_toml_string(config.server.host)}
 port = {config.server.port}
 workers = {config.server.workers}
 
 [storage]
-data_dir = "{config.storage.data_dir}"
-database = "{config.storage.database}"
+data_dir = {_toml_string(str(config.storage.data_dir))}
+database = {_toml_string(str(config.storage.database))}
 max_upload_size_mb = {config.storage.max_upload_size_mb}
 
 [repository]
@@ -236,6 +313,17 @@ allow_overwrite = {allow_overwrite}
 [performance]
 upload_chunk_size_kb = {config.performance.upload_chunk_size_kb}
 sqlite_busy_timeout_ms = {config.performance.sqlite_busy_timeout_ms}
+
+[branding]
+# Shown in page titles, the index heading, the footer and the Basic auth realm.
+name = {_toml_string(config.branding.name)}
+tagline = {_toml_string(config.branding.tagline)}
+# Extra HTML appended to the footer of every page, rendered exactly as written.
+# Only put trusted markup here. Empty for none.
+footer = {_toml_string(config.branding.footer)}
+# Accent colours for the light and dark themes.
+accent = {_toml_string(config.branding.accent)}
+accent_dark = {_toml_string(config.branding.accent_dark)}
 """
 
 
@@ -248,6 +336,7 @@ def default_config(data_dir: str | Path, *, database: str | Path | None = None) 
         storage=StorageConfig(data_dir=data_dir, database=db),
         repository=RepositoryConfig(),
         performance=PerformanceConfig(),
+        branding=BrandingConfig(),
     )
 
 

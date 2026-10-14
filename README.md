@@ -185,7 +185,26 @@ allow_overwrite = true           # same filename + different bytes replaces
 [performance]
 upload_chunk_size_kb = 1024
 sqlite_busy_timeout_ms = 5000
+
+[branding]
+name = "PyPISwasta"              # page titles, index heading, Basic realm
+tagline = "A minimal wheel-only Python package index."
+footer = ""                      # extra HTML appended to the page footer
+accent = "#2b5cd9"               # light theme
+accent_dark = "#8ab4ff"          # dark theme
 ```
+
+### Branding
+
+`[branding]` is optional and changes only presentation: the product name (which
+also becomes the HTTP Basic realm that password prompts display), the tagline
+under the index heading, the accent colours for the light and dark themes, and a
+`footer` string of extra HTML appended to the footer of every page. Nothing else
+— URLs, permissions, JSON field names — is affected, so changing branding never
+breaks an already-configured client.
+
+`footer` is inserted as-is, so only put trusted markup in it. It is read from
+the config file at startup and can never come from a request.
 
 ## Deployment
 

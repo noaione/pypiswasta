@@ -89,9 +89,16 @@ password_hash = ""  # set by init/rotation
 [performance]
 upload_chunk_size_kb = 1024
 sqlite_busy_timeout_ms = 5000
+
+[branding]
+name = "PyPISwasta"
+tagline = "A minimal wheel-only Python package index."
+footer = ""          # extra HTML appended to every page footer
+accent = "#2b5cd9"   # light theme
+accent_dark = "#8ab4ff"
 ```
 
-No `authentication.enabled`, `allow_sdist`, JSON enable toggle, metadata enable toggle, or public enable toggle: these are fixed behavior. Consider hardcoding `workers=1` initially rather than implying live multiworker config synchronization. TOML must be parsed and validated as a whole, including unique usernames, hash format, valid paths, sane upload limits and enum values.
+No `authentication.enabled`, `allow_sdist`, JSON enable toggle, metadata enable toggle, or public enable toggle: these are fixed behavior. Consider hardcoding `workers=1` initially rather than implying live multiworker config synchronization. TOML must be parsed and validated as a whole, including unique usernames, hash format, valid paths, sane upload limits and enum values. `[branding]` is optional and presentation-only (§15.8).
 
 ### Credential strategy
 
@@ -476,4 +483,42 @@ private index succeeds with reader credentials configured via
 `[[tool.uv.index]]`, or with credentials embedded in the index URL. The
 `upload` role is refused. `UV_HTTP_BASIC_USERNAME`/`UV_HTTP_BASIC_PASSWORD` do
 **not** authenticate index requests.
+
+### 15.8 Operator-configurable branding
+
+`[branding]` in the TOML file lets a deployment present its own identity. Every
+key is optional; the defaults reproduce the stock look.
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `name` | `PyPISwasta` | Page titles (`<page> — <name>`), the index `<h1>`, the footer, and the **HTTP Basic realm** shown in password prompts |
+| `tagline` | `A minimal wheel-only Python package index.` | Sub-heading on the index page and the default `<meta name="description">` |
+| `footer` | `""` | Extra HTML appended to the footer of every page |
+| `accent` | `#2b5cd9` | Accent colour, light theme |
+| `accent_dark` | `#8ab4ff` | Accent colour, dark theme |
+
+`web.py` owns all of it: one `STYLESHEET` template with `__ACCENT__` and
+`__ACCENT_DARK__` placeholders, one `render_page()` shell that keeps the footer
+inside `<main>`, and page builders that take `branding` as a keyword argument.
+Every caller reaches them through `config.branding`, so there is no second
+source of truth for the product name.
+
+The realm is derived rather than stored: `BrandingConfig.realm` drops
+non-printable characters and `"`/`\`, so a name containing a quote cannot break
+the quoted `WWW-Authenticate` value, and a name made entirely of control
+characters falls back to the default. This is why the old module-level `REALM`
+constant is gone.
+
+Escaping is deliberately split:
+
+- `name`, `tagline`, usernames and generated passwords go through `web.esc()`.
+- `footer` is inserted **verbatim**. It is trusted operator input read from a
+  `0600` file at startup and is never reachable from a request, which is the
+  only reason rendering raw markup is acceptable.
+
+Validation rejects an empty or over-long `name` (64 chars), an over-long
+`tagline` (200) or `footer` (500), control characters in any of those three, and
+any accent that is not a 3-, 6- or 8-digit hex colour. `render_config()` writes
+the section back out with explanatory comments and the example footer inside a
+comment, so `pypiswasta init` produces a self-documenting file.
 

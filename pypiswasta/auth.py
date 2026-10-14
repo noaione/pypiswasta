@@ -35,8 +35,6 @@ from fastapi import HTTPException, Request
 
 from . import db as db_module
 
-REALM = 'Basic realm="PyPISwasta"'
-
 _DOMAIN_SEPARATOR = b"pypiswasta:password:v1:"
 
 # Roles are deliberately *not* a linear hierarchy: ``upload`` may publish but
@@ -249,11 +247,13 @@ def parse_basic_auth(header: str | None) -> tuple[str, str] | None:
         return None
 
 
-def unauthorized() -> HTTPException:
+def unauthorized(request: Request) -> HTTPException:
+    """401 with a challenge that names the configured branding."""
+    realm = request.app.state.config.branding.realm
     return HTTPException(
         status_code=401,
         detail="Authentication required",
-        headers={"WWW-Authenticate": REALM},
+        headers={"WWW-Authenticate": f'Basic realm="{realm}"'},
     )
 
 
@@ -264,11 +264,11 @@ def forbidden() -> HTTPException:
 def _current_credential(request: Request) -> Credential:
     parsed = parse_basic_auth(request.headers.get("authorization"))
     if parsed is None:
-        raise unauthorized()
+        raise unauthorized(request)
     store: AuthStore = request.app.state.auth
     credential = store.authenticate(*parsed)
     if credential is None:
-        raise unauthorized()
+        raise unauthorized(request)
     return credential
 
 
