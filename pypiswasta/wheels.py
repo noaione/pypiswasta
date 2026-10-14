@@ -23,6 +23,7 @@ from .distributions import (
     DistributionError,
     DistributionInfo,
     UploadTooLargeError,
+    parse_optional_core_metadata,
     reject_unsafe_filename,
     stage_upload,
 )
@@ -130,7 +131,7 @@ def _read_member_bounded(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> byt
     return data
 
 
-def _parse_core_metadata(data: bytes, name: str, version: str) -> str | None:
+def _parse_core_metadata(data: bytes, name: str, version: str) -> tuple[str | None, str]:
     try:
         message = email.message_from_bytes(data)
     except Exception as exc:  # pragma: no cover - defensive
@@ -150,10 +151,7 @@ def _parse_core_metadata(data: bytes, name: str, version: str) -> str | None:
     except InvalidVersion as exc:
         raise WheelError(f"invalid core metadata Version: {meta_version!r}") from exc
 
-    requires_python = message.get("Requires-Python")
-    if requires_python is not None:
-        requires_python = requires_python.strip() or None
-    return requires_python
+    return parse_optional_core_metadata(message)
 
 
 def inspect_wheel(path: Path, filename: str) -> WheelInfo:
@@ -170,11 +168,12 @@ def inspect_wheel(path: Path, filename: str) -> WheelInfo:
     except zipfile.BadZipFile as exc:
         raise WheelError(f"corrupt wheel archive: {exc}") from exc
 
-    requires_python = _parse_core_metadata(metadata_bytes, name, version)
+    requires_python, summary = _parse_core_metadata(metadata_bytes, name, version)
     return DistributionInfo(
         name=name,
         version=version,
         requires_python=requires_python,
+        summary=summary,
         metadata_bytes=metadata_bytes,
         packagetype=PACKAGETYPE_WHEEL,
     )

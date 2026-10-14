@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import os
 from dataclasses import dataclass
+from email.message import Message
 from pathlib import Path
 from typing import BinaryIO
 
@@ -41,6 +42,7 @@ class DistributionInfo:
     name: str  # normalized PEP 503 name
     version: str  # normalized version
     requires_python: str | None
+    summary: str  # the core metadata Summary; "" when absent
     metadata_bytes: bytes
     packagetype: str  # db.PACKAGETYPE_WHEEL or db.PACKAGETYPE_SDIST
 
@@ -62,6 +64,20 @@ def distribution_kind(filename: str) -> str | None:
     if lowered.endswith(SDIST_EXTENSION):
         return db.PACKAGETYPE_SDIST
     return None
+
+
+def parse_optional_core_metadata(message: Message) -> tuple[str | None, str]:
+    """Read the two core-metadata fields this index keeps from an upload.
+
+    ``METADATA`` inside a wheel and ``PKG-INFO`` inside an sdist are both core
+    metadata, so the header names are shared and this lives in neither inspector:
+    ``Requires-Python`` feeds the index filter, ``Summary`` feeds the legacy
+    search that ``pip search`` uses.
+    """
+    requires_python = message.get("Requires-Python")
+    if requires_python is not None:
+        requires_python = requires_python.strip() or None
+    return requires_python, (message.get("Summary") or "").strip()
 
 
 def reject_unsafe_filename(filename: str, error: type[DistributionError]) -> None:

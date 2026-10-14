@@ -4,11 +4,13 @@ Status: implementation-ready design · October 2026
 
 ## 1. Goal and non-goals
 
-Implement a minimal **wheel-only** Python package index behind an existing Caddy reverse proxy. It supports publicly readable packages and separately authenticated private access, with one shared set of packages. A single configured role credential per `admin`, `upload`, and `reader` (three credentials, no user accounts). A client can publish or reinstall a wheel with the same distribution filename and different bytes. Configuration is TOML; SQLite stores package and artifact metadata only; wheels and extracted core metadata are immutable files on disk.
+Implement a minimal Python package index behind an existing Caddy reverse proxy. It supports publicly readable packages and separately authenticated private access, with one shared set of packages. A single configured role credential per `admin`, `upload`, and `reader` (three credentials, no user accounts), plus optional per-machine upload tokens (§15.11). A client can publish or reinstall a distribution with the same filename and different bytes. Configuration is TOML; SQLite stores package and artifact metadata only; artifact bytes and extracted core metadata are immutable files on disk.
 
 Primary clients: `uv`, `pip`, and `twine`.
 
-Non-goals for v0.1: source distributions, mirrors/proxying PyPI, package building, package signing/attestations, per-version visibility, multiple users per role, browser dashboard, token issuance, searchable package catalog, CDN, automatic external garbage collection.
+This document is the design as written. Where the implementation diverges — source distributions, catalog search, tokens, and XML-RPC search — §15 records what was actually built and why.
+
+Non-goals for v0.1: mirrors/proxying PyPI, package building, package signing/attestations, per-version visibility, multiple users per role, browser dashboard, CDN, automatic external garbage collection. **Revised during implementation:** source distributions (§15.9), a searchable package catalog (§15.10, §15.12), and token issuance (§15.11) were added afterwards and are no longer non-goals.
 
 ### Invariants
 
@@ -17,11 +19,11 @@ Non-goals for v0.1: source distributions, mirrors/proxying PyPI, package buildin
 3. `upload` role can publish, but cannot read private projects. `admin` can perform all actions.
 4. All private wheel **and metadata** URLs require `reader` or `admin`; public URLs must check visibility independently of index listings.
 5. Newly created projects are private by default. Visibility is project-wide, including all versions.
-6. Uploads accept `.whl` only; sdists are always rejected. Re-uploading the same filename replaces it if allowed by config, regardless of bytes/version.
+6. Uploads accept `.whl` and `.tar.gz` sdists (§15.9); each file is inspected according to its own extension, and any other extension is rejected. Re-uploading the same filename replaces it if allowed by config, regardless of bytes/version.
 7. Published bytes are immutable and identified by SHA-256. SQLite points at the current wheel; index pages never link to partially uploaded objects.
 8. Config and credential hashes exist in TOML and are cached in memory; **no SQLite lookup for authentication**.
 9. Passwords for `upload` and `reader` are generated automatically; administrator may optionally set a password interactively. Never store or log plaintext credentials.
-10. Support HTML Simple API and JSON Simple API, including wheel SHA-256, `Requires-Python`, and core metadata sidecars.
+10. Support HTML Simple API and JSON Simple API, including SHA-256, `Requires-Python`, and core metadata sidecars for every artifact kind.
 
 ## 2. Stack
 
@@ -98,7 +100,7 @@ accent = "#2b5cd9"   # light theme
 accent_dark = "#8ab4ff"
 ```
 
-No `authentication.enabled`, `allow_sdist`, JSON enable toggle, metadata enable toggle, or public enable toggle: these are fixed behavior. Consider hardcoding `workers=1` initially rather than implying live multiworker config synchronization. TOML must be parsed and validated as a whole, including unique usernames, hash format, valid paths, sane upload limits and enum values. `[branding]` is optional and presentation-only (§15.8).
+No `authentication.enabled`, JSON enable toggle, metadata enable toggle, or public enable toggle: these are fixed behavior. There is no `allow_sdist` toggle either: sdists are supported unconditionally (§15.9), because selecting among artifact kinds is exactly what the Simple API client does for itself. Consider hardcoding `workers=1` initially rather than implying live multiworker config synchronization. TOML must be parsed and validated as a whole, including unique usernames, hash format, valid paths, sane upload limits and enum values. `[branding]` is optional and presentation-only (§15.8).
 
 ### Credential strategy
 
@@ -305,7 +307,7 @@ When force replacing the *same wheel/version*, publish without a duplicate-skip/
 ### Wheel processing
 
 - Valid pure Python wheel; platform wheel; multiple versions; normalized names.
-- Sdist, fake wheel, corrupt ZIP, path traversal, duplicate metadata, mismatch between filename/metadata/legacy fields rejected.
+- Fake wheel, corrupt ZIP, path traversal, duplicate metadata, mismatch between filename/metadata/legacy fields rejected; sdists pass the same gate with tar-specific checks (§15.9).
 - ZIP bombs / huge metadata / oversize uploads rejected without unbounded RAM.
 - SHA-256 and sidecar SHA-256 equal independently calculated digests.
 - Simultaneous upload of same filename with different bytes ends in one fully consistent current row/object.
@@ -523,6 +525,177 @@ Escaping is deliberately split:
 - `footer` is inserted **verbatim**. It is trusted operator input read from a
   `0600` file at startup and is never reachable from a request, which is the
   only reason rendering raw markup is acceptable.
+
+### 15.9 Source distributions are supported
+
+Wheel-only was the original design (§1, invariant 6). That was reversed: sdists
+are accepted, indexed, and served like any other artifact, because a package that
+cannot be published as an sdist cannot be installed from source on a platform
+with no matching wheel.
+
+The change is mostly one column and one dispatch:
+
+- `artifacts.packagetype` (schema v2) records `bdist_wheel` or `sdist`.
+- `app._handle_upload()` classifies each part with
+  `distributions.distribution_kind()` and calls `sdists.inspect_sdist()` or
+  `wheels.inspect_wheel()` accordingly. Anything that is neither `.whl` nor
+  `.tar.gz` is rejected before any bytes are stored.
+- `upsert_artifact()` takes `packagetype` alongside the metadata it already took,
+  so one distribution version can hold a wheel and an sdist at once.
+
+The two inspectors now share their common parts through a new `distributions.py`,
+so validation cannot drift between them: `DistributionError` (with its
+`UploadTooLargeError` subclass) is the single exception the upload handler maps to
+`400`, `DistributionInfo` is the single result type, and
+`parse_optional_core_metadata()`, `reject_unsafe_filename()`, and
+`stage_upload()` are shared helpers. `wheels.py` re-exports the previous names via
+`__all__`, so `WheelError` and `WheelInfo` remain valid import sites.
+
+Sdist validation is stricter than wheel validation, because a tar archive is a
+filesystem image rather than a zip with a fixed layout:
+
+- the filename must parse as `name-version.tar.gz`;
+- the archive is read in **streaming** mode (`TarFile.open(mode="r|")`), since the
+  upload is a stream that cannot be seeked;
+- every member name is rejected for absolute paths, backslashes, `..` segments,
+  Windows drive letters, and a missing or mismatched top-level directory;
+- at most 20,000 members are scanned and the metadata member is capped at 8 MiB;
+- decompression is budgeted to 1 GiB of *decompressed* bytes, which is what stops
+  a decompression bomb. `sdists._BudgetedReader` enforces it.
+
+`_BudgetedReader` was first written against a `Protocol` describing what
+`tarfile` needs, which left it an **abstract** class and made instantiation a type
+error. It now subclasses `io.RawIOBase` and implements `readinto()` — the single
+method the base class needs in order to supply `read()` — plus an explicit
+`write()` override raising `io.UnsupportedOperation`, matching the read-only
+semantics `seek()` and `tell()` already declare. The remaining overrides exist
+because `RawIOBase` is deliberately permissive: `read()` does **not** check
+`closed`, so a closed reader would keep serving bytes. `readinto()` therefore
+raises `ValueError("I/O operation on closed file")` first, then applies the
+cumulative budget and raises `SdistError` once it is exhausted.
+
+An sdist's core metadata is its `PKG-INFO`, stored as the same
+`<filename>.metadata` sidecar used for wheels and advertised with the same PEP 714
+`data-core-metadata` / `core-metadata` attributes. `Requires-Python` and the
+summary come from it; when a project predates PEP 643 and its `PKG-INFO` omits
+`Requires-Python`, the field stays absent rather than being guessed.
+
+Because sdists are first-class, `allow_sdist` is gone rather than merely
+re-defaulted: artifact kind is a property of each uploaded file, and clients
+already choose which kinds to install.
+
+### 15.10 Catalog search
+
+There is no full-text index. Search is `LIKE` over two fields — the project name
+and the summary — which suffices for the catalog sizes this index targets and
+needs no extra dependency or index rebuild.
+
+- `GET /search?q=...` renders HTML: name, current version, summary, and a private
+  marker. The landing page embeds the form, which submits as `GET`.
+- `db.search_installable_projects(query, include_private)` returns one row per
+  project with a `file_count`, filtered by the same visibility rule the Simple
+  API uses, so a private project cannot leak through search.
+- `_like_pattern()` escapes `\`, `%`, and `_` before wrapping the term in
+  `%...%`, so a query containing `%` searches for a literal `%` instead of
+  matching every row.
+
+Visibility reuses `auth.optional_reader()`: no `Authorization` header means an
+anonymous search limited to public projects, while `reader` or `admin` credentials
+widen the result set to include private ones. A *malformed* credential is still an
+error rather than a silent downgrade to anonymous, so a client with a stale
+password is told so instead of quietly seeing fewer results.
+
+An empty or absent `q` is not an error: the page renders with its form and no
+results.
+
+`/search` is not part of the Simple API and sets `Cache-Control: no-store`, since
+its content depends on the caller's credential.
+
+### 15.11 Upload tokens
+
+Three shared role credentials cannot express "this CI job" without copying a
+password around or rotating it for everyone. Schema v2 adds a `tokens` table
+(`name`, `role`, `algorithm`, `password_hash`, `hint`), managed entirely from the
+CLI:
+
+| Command | Effect |
+| --- | --- |
+| `pypiswasta token create <name> [--role upload\|reader]` | generates a secret and prints it once |
+| `pypiswasta token list` | names, roles, and hints |
+| `pypiswasta token remove <name>` | deletes the row |
+
+Design points worth pinning:
+
+- A token is an additional credential, never a replacement.
+  `AuthStore.install()` adds tokens to `_by_username` but **not** to `_by_role`,
+  so a token named `upload` cannot displace the `upload` role credential, and the
+  role's allow-set still governs what `upload` may read (§15.5).
+- `token create` refuses a name reported by `usernames_in_use()`, the union of role
+  credentials and existing token names. The same check now backs
+  `auth set-username`, so a collision cannot be created from either direction.
+- Secrets are `pypisw_`-prefixed and stored as a SHA-256 digest, while a
+  human-chosen admin password is Argon2id. The `algorithm` column records which,
+  so verification never applies the wrong scheme to a secret.
+- `hint` (for example `pypisw_9f3c…a1b2`) is stored because a digest is not
+  reversible: without it, `token list` could not tell an operator which of several
+  tokens to delete. The hint is a display convenience, not a credential — the
+  exposed prefix and suffix are far too short to narrow a 256-bit secret.
+- A token authenticates either as `__token__` with the secret as the password (the
+  convention `twine` and `pypa/gh-action-pypi-publish` assume) or under its own
+  name.
+- Tokens participate in the in-memory snapshot like everything else, so creating,
+  removing, or re-roleing one requires a restart (§15.1).
+
+### 15.12 XML-RPC search at `/pypi`
+
+`pip search` no longer works against public PyPI, but the client still speaks the
+legacy PyPI XML-RPC protocol. `POST /pypi` implements the one method that makes a
+pinned or patched client usable again. `rpc.py` holds the protocol; `app.py` only
+reads the body and hands it a query callback.
+
+The endpoint is deliberately not at the index root, because `/` serves the Simple
+API. A client is pointed at `/pypi` explicitly:
+
+```sh
+pip search --index https://index.example/pypi requests
+```
+
+`--index` is used verbatim as the XML-RPC URL, which is why the path is `/pypi`
+(public PyPI's own `PyPI.pypi_url` value) rather than anything tied to this
+project's naming.
+
+Protocol details:
+
+- The body is streamed with a 64 KiB cap (`rpc.MAX_REQUEST_BYTES`), counted as it
+  arrives rather than trusting `Content-Length`, so an oversized body is never
+  buffered in full. Exceeding the cap is a `-32700` fault rather than a `413`: the
+  client is already expecting a `methodResponse` document and can report an XML-RPC
+  fault far more usefully than an HTTP status it never looks at.
+- Every failure is a fault. Malformed XML and unparseable documents are `-32700`,
+  an unsupported method is `-32601`, and bad arguments are `-32602`. Nothing
+  raises out of the handler, because a fault is the only channel the protocol has.
+- Responses are `text/xml` with `Cache-Control: no-store`, since a result and a
+  fault both depend on the caller's credential.
+- `search(spec, operator)` is evaluated **per artifact**, which is why
+  `db.search_project_hits()` returns one row per artifact instead of aggregating
+  per project the way the HTML search does. A project found by name reports all its
+  current versions; a project found only through a summary reports just the
+  versions whose summary matched.
+- Name terms are compared through `canonicalize_name()`, so `my_package` finds
+  `my-package`; summary terms are plain case-insensitive substrings. `or` keeps a
+  version when any term matches, `and` requires every term — and because pip sends
+  the same words under both `name` and `summary`, the terms are collapsed with
+  `dict.fromkeys()` before the operator is applied, so `and` does not silently
+  demand two matches for one word.
+- Results are `{"name", "version", "summary"}` with all three keys always present,
+  because the client indexes them directly, and a version published as both a wheel
+  and an sdist is emitted once.
+- Visibility matches `/search`: anonymous callers see public projects, `reader` or
+  `admin` credentials also reveal private ones.
+
+`/pypi` and `/pypi/` are both registered, for the same reason as `/legacy` (§15.6):
+with `redirect_slashes=False`, a redirect would make the client replay the entire
+request body for no benefit.
 
 Validation rejects an empty or over-long `name` (64 chars), an over-long
 `tagline` (200) or `footer` (500), control characters in any of those three, and

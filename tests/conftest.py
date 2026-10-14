@@ -44,6 +44,7 @@ def build_wheel(
     version: str = "1.0.0",
     *,
     requires_python: str | None = ">=3.9",
+    summary: str | None = None,
     metadata_name: str | None = None,
     metadata_version: str | None = None,
     extra_members: dict[str, bytes] | None = None,
@@ -58,6 +59,8 @@ def build_wheel(
         f"Name: {metadata_name or name}",
         f"Version: {metadata_version or version}",
     ]
+    if summary is not None:
+        metadata_lines.append(f"Summary: {summary}")
     if requires_python:
         metadata_lines.append(f"Requires-Python: {requires_python}")
     metadata = ("\n".join(metadata_lines) + "\n\n").encode()
@@ -94,6 +97,7 @@ def build_sdist(
     version: str = "1.0.0",
     *,
     requires_python: str | None = ">=3.9",
+    summary: str | None = None,
     metadata_name: str | None = None,
     metadata_version: str | None = None,
     extra_members: dict[str, bytes] | None = None,
@@ -114,6 +118,8 @@ def build_sdist(
         f"Name: {metadata_name or name}",
         f"Version: {metadata_version or version}",
     ]
+    if summary is not None:
+        pkg_info_lines.append(f"Summary: {summary}")
     if requires_python:
         pkg_info_lines.append(f"Requires-Python: {requires_python}")
     pkg_info = ("\n".join(pkg_info_lines) + "\n\n").encode()

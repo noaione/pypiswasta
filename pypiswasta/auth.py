@@ -23,7 +23,7 @@ import hmac
 import re
 import secrets
 from dataclasses import dataclass
-from typing import Any, Iterable, Protocol
+from typing import Any, Iterable, Protocol, SupportsIndex, overload
 
 from argon2 import PasswordHasher
 from argon2.exceptions import (
@@ -191,7 +191,10 @@ def generate_credential(role: str, *, username: str | None = None) -> tuple[Cred
 class _RowLike(Protocol):
     """Anything indexable by column name: a ``sqlite3.Row`` or a plain mapping."""
 
-    def __getitem__(self, key: str) -> Any: ...
+    @overload  # Note: really needs int instead of SupportsIndex
+    def __getitem__(self, key: int | str, /) -> Any: ...
+    @overload  # Note: SupportsIndex does work within slices.
+    def __getitem__(self, key: slice[SupportsIndex | None], /) -> tuple[Any, ...]: ...
 
 
 class AuthStore:

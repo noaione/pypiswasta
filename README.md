@@ -1,12 +1,15 @@
 # PyPISwasta
 
-A minimal, **wheel-only** Python package index you can run behind your own
-reverse proxy. Public packages are readable by anyone; private packages need a
-shared credential. One credential per role, no user accounts.
+A minimal Python package index you can run behind your own reverse proxy. It
+serves wheels and source distributions. Public packages are readable by anyone;
+private packages need a shared credential. One credential per role, plus
+optional upload tokens.
 
 - **Public** index: `GET /simple/` — anonymous.
 - **Private** index: `GET /private/simple/` — `reader` or `admin`.
+- **Search**: `GET /search?q=...` — anonymous sees public projects; `reader`/`admin` also see private ones.
 - **Publishing**: `POST /legacy/` — `upload` or `admin` (works with `uv publish` and `twine`).
+- **Legacy search**: `POST /pypi` — XML-RPC `search`, for `pip search`.
 - **Administration**: `GET/PATCH/DELETE /api/admin/packages` — `admin` only.
 
 Design highlights:
@@ -15,12 +18,13 @@ Design highlights:
   cached in memory so no request performs a database lookup while authenticating.
 - First boot forces a **one-time setup page**; nothing else is reachable until an
   administrator account exists.
-- Published wheel bytes are **immutable and content-addressed** by SHA-256; the
-  database points at the current wheel and index pages never link to a partially
-  uploaded object.
+- Published artifact bytes are **immutable and content-addressed** by SHA-256; the
+  database points at the current artifact and index pages never link to a
+  partially uploaded object.
 - Serves the current **Simple Repository API** in both HTML and JSON, plus
   PEP 658/714 `core-metadata` sidecars.
-- `.whl` only — source distributions are always rejected.
+- Accepts `.whl` **and sdists** (`.tar.gz`); both are indexed and listed with
+  sidecars built from their `METADATA`/`PKG-INFO`.
 
 ## Requirements
 
@@ -57,19 +61,27 @@ passwords are generated with 256 bits of entropy and displayed exactly once:
 
 The `upload` role deliberately cannot read private projects.
 
-## Publishing a wheel
+## Publishing
 
 ```sh
-uv build --wheel
+uv build
 
 # Credentials come from uv's auth store or the environment; avoid inline history.
 export UV_PUBLISH_USERNAME=publisher
 export UV_PUBLISH_PASSWORD='<the generated upload password>'
 
-uv publish --publish-url http://127.0.0.1:8374/legacy/ dist/*.whl
+uv publish --publish-url http://127.0.0.1:8374/legacy/ dist/*
 ```
 
-`twine upload --repository-url http://127.0.0.1:8374/legacy/ dist/*.whl` works too.
+```sh
+twine upload --repository-url http://127.0.0.1:8374/legacy/ dist/*
+```
+
+Both tools `POST` to the collection URL. `/legacy` without the trailing slash is
+served directly rather than redirected, because a redirect would make the client
+replay the whole multipart body. Wheels and sdists may be uploaded in the same
+request; each file is validated on its own, and a rejected file fails the whole
+request.
 
 New projects are **private by default**. Make one public with the admin API or
 the CLI:
@@ -132,6 +144,55 @@ Both indexes also speak JSON:
 curl -H 'Accept: application/vnd.pypi.simple.v1+json' http://127.0.0.1:8374/simple/my-package/
 ```
 
+## Searching
+
+A plain HTML catalog search lives at `/search`:
+
+```sh
+curl 'http://127.0.0.1:8374/search?q=requests'
+```
+
+Results show the project, its current version, its summary, and whether it is
+private. Anonymous callers only ever see **public** projects; send `reader` or
+`admin` credentials and private projects appear in the same result set.
+
+### `pip search` (XML-RPC)
+
+`pip search` was switched off on public PyPI, but the client still speaks the
+legacy PyPI XML-RPC protocol. This index implements the `search` method alone, at
+`POST /pypi`:
+
+```sh
+pip search --index https://index.example.com/pypi requests
+```
+
+The `--index` value is used **verbatim** as the XML-RPC endpoint, so it must point
+at `/pypi` and not at the index root — that root serves the Simple API, which is a
+different protocol on the same host. Clients configured through
+`PyPI.pypi_url` (patched `pip._internal`, vendored copies) should point the same
+way; public PyPI's value is `https://pypi.org/pypi`.
+
+The call takes two arguments, exactly as pip sends them:
+
+| Argument | Value |
+| --- | --- |
+| `spec` | a struct; `{"name": ["..."], "summary": ["..."]}`, either key optional |
+| `operator` | `"or"` keeps a version when any term matches, `"and"` requires every term to match |
+
+Each result is `{"name", "version", "summary"}` — all three keys are always
+present, because the client indexes them directly. Name terms are matched after
+PEP 503 canonicalization (so `my_package` finds `my-package`); summary terms are
+case-insensitive substring matches. Only the **current** version of a project is
+searched, and a published wheel and sdist for the same version are reported once.
+
+Anonymous callers see public projects only; `reader` or `admin` credentials also
+reveal private ones. Any method other than `search` returns an XML-RPC fault
+(`-32601`), and malformed arguments return `-32602`. A raw check without pip:
+
+```sh
+python -c "import xmlrpc.client; p = xmlrpc.client.ServerProxy('http://127.0.0.1:8374/pypi'); print(p.search({'name': ['requests'], 'summary': ['requests']}, 'or'))"
+```
+
 ## Credentials
 
 | Command | Purpose |
@@ -151,6 +212,41 @@ Only `set-admin-password` is interactive; everything else is scriptable. The
 service reads credentials at startup, so **restart it** to pick up a change made
 with the CLI.
 
+### Upload tokens
+
+Role credentials are shared, which makes them impossible to revoke for one
+publisher without breaking everyone. Tokens are per-machine secrets with the same
+`upload` or `reader` permissions:
+
+```sh
+pypiswasta token create github-actions --role upload
+# token 'github-actions' (upload) created; store it now, it is not shown again
+#   pypisw_9Fk2...rT7w
+
+pypiswasta token list
+pypiswasta token remove github-actions
+```
+
+Authenticate either as `__token__` (what `twine` and
+`pypa/gh-action-pypi-publish` default to) or by the token's own name:
+
+```sh
+uv publish --username __token__ --password 'pypisw_...' \
+  --publish-url https://index.example.com/legacy/
+```
+
+The secret is shown once, at creation. `token list` prints a hint
+(`pypis_9Fk2…rT7w`) instead of the secret so you can tell tokens apart when
+deciding which one to remove. A token's name may not collide with a role's
+username. Token secrets are stored as **SHA-256** digests, while human-chosen
+admin passwords use Argon2id — the stored hash records which algorithm applies,
+so a secret is never verified against the wrong one.
+
+Tokens cannot displace the role credentials: a role's username and password
+always keep working, and the `upload` role still cannot read private packages.
+Because the auth table is cached in memory, **restart the service** after
+creating, removing, or re-roleing a token.
+
 ## Other CLI commands
 
 ```sh
@@ -159,6 +255,10 @@ pypiswasta package visibility <name> public|private
 pypiswasta package delete <name>
 pypiswasta gc --dry-run          # report unreferenced objects
 pypiswasta gc                    # delete them (1 hour grace by default)
+
+pypiswasta token create <name> --role upload|reader
+pypiswasta token list            # names, roles, and secret hints
+pypiswasta token remove <name>
 ```
 
 ## Configuration
@@ -236,9 +336,10 @@ uv sync --all-groups
 
 ## Not supported
 
-Source distributions, mirroring PyPI, package building, signing/attestations,
-per-version visibility, multiple users per role, a token API, and a searchable
-catalog.
+Mirroring PyPI, package building, signing/attestations, per-version visibility,
+multiple users per role, and a browser dashboard. Search covers names and
+summaries only: no full-text ranking, no download counts, no keyword extraction,
+and the XML-RPC endpoint exposes the single method `search`.
 
 ## Specifications
 

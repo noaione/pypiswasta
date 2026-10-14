@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
 from packaging.utils import canonicalize_name
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 ROLES = ("admin", "upload", "reader")
 
@@ -87,7 +87,15 @@ CREATE TABLE IF NOT EXISTS tokens (
 );
 """
 
-MIGRATIONS: tuple[tuple[int, str], ...] = ((1, _SCHEMA_V1), (2, _SCHEMA_V2))
+# v3 stores the ``Summary`` field of each artifact's core metadata. The legacy
+# XML-RPC search that ``pip search`` uses matches against names *and* summaries,
+# and the summary is also what pip prints beside each hit. It is read from the
+# metadata blob the upload path already parses, so nothing else is needed.
+_SCHEMA_V3 = """
+ALTER TABLE artifacts ADD COLUMN summary TEXT NOT NULL DEFAULT '';
+"""
+
+MIGRATIONS: tuple[tuple[int, str], ...] = ((1, _SCHEMA_V1), (2, _SCHEMA_V2), (3, _SCHEMA_V3))
 
 
 def _like_pattern(query: str) -> str:
@@ -250,6 +258,48 @@ class Database:
         sql += " GROUP BY p.id ORDER BY p.name"
         return list(self.conn.execute(sql, params).fetchall())
 
+    def search_project_hits(
+        self,
+        *,
+        name_terms: Sequence[str],
+        summary_terms: Sequence[str],
+        include_private: bool,
+    ) -> list[sqlite3.Row]:
+        """Artifacts that might match, one row per artifact.
+
+        Deliberately a superset of the final answer: the prefilter is a single
+        ``OR`` across all terms, because "every term must appear somewhere" is
+        not expressible as one pattern test. The caller applies the operator.
+
+        Returns ``name``, ``private``, ``version`` and ``summary`` per row.
+        """
+        clauses: list[str] = []
+        params: list[object] = []
+        for term in name_terms:
+            normalized = canonicalize_name(term or "")
+            if not normalized:
+                continue
+            clauses.append("p.name LIKE ? ESCAPE '\\'")
+            params.append(_like_pattern(normalized))
+        for term in summary_terms:
+            # SQLite's LIKE is case-insensitive for ASCII, which is what a
+            # human-typed summary search needs.
+            text = (term or "").strip().lower()
+            if not text:
+                continue
+            clauses.append("a.summary LIKE ? ESCAPE '\\'")
+            params.append(_like_pattern(text))
+        if not clauses:
+            return []
+
+        sql = "SELECT p.name AS name, p.private AS private, a.version AS version, a.summary AS summary"
+        sql += " FROM artifacts a JOIN packages p ON p.id = a.package_id"
+        sql += " WHERE (" + " OR ".join(clauses) + ")"
+        if not include_private:
+            sql += " AND p.private = 0"
+        sql += " ORDER BY p.name, a.version DESC"
+        return list(self.conn.execute(sql, params).fetchall())
+
     def _select_projects(
         self,
         *,
@@ -313,13 +363,14 @@ class Database:
         size: int,
         requires_python: str | None,
         packagetype: str = PACKAGETYPE_WHEEL,
+        summary: str = "",
     ) -> None:
         conn.execute(
             """
             INSERT INTO artifacts (
                 package_id, filename, version, sha256, metadata_sha256, size,
-                requires_python, packagetype
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                requires_python, packagetype, summary
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(package_id, filename) DO UPDATE SET
                 version = excluded.version,
                 sha256 = excluded.sha256,
@@ -327,6 +378,7 @@ class Database:
                 size = excluded.size,
                 requires_python = excluded.requires_python,
                 packagetype = excluded.packagetype,
+                summary = excluded.summary,
                 uploaded_at = CURRENT_TIMESTAMP,
                 replaced_at = CASE
                     WHEN artifacts.sha256 <> excluded.sha256
@@ -343,6 +395,7 @@ class Database:
                 size,
                 requires_python,
                 packagetype,
+                summary,
             ),
         )
 

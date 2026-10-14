@@ -172,6 +172,7 @@ private: /private/simple/</pre>
   <li><a href="/simple/">/simple/</a> &mdash; public project index (HTML or JSON)</li>
   <li><a href="/private/simple/">/private/simple/</a> &mdash; all projects (reader credentials)</li>
   <li><a href="/search">/search</a> &mdash; find a project by name</li>
+  <li><code>POST /pypi</code> &mdash; XML-RPC <code>search</code>, for <code>pip search</code></li>
   <li><code>POST /legacy/</code> &mdash; upload a wheel or sdist (upload credentials)</li>
   <li><code>GET /api/admin/packages</code> &mdash; admin package listing</li>
   <li><a href="/healthz">/healthz</a></li>

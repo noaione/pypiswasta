@@ -21,7 +21,7 @@ from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 from starlette.datastructures import UploadFile
 
-from . import simple, web
+from . import rpc, simple, web
 from .auth import (
     AuthStore,
     Credential,
@@ -283,6 +283,38 @@ def _install_routes(app: FastAPI) -> None:
             results=results,
             authenticated=credential is not None,
         )
+
+    # -- legacy XML-RPC search (pip search) ----------------------------------
+
+    # pip's search command builds an xmlrpc ServerProxy from the URL given to
+    # --index, verbatim, and expects name/summary/version structs back. Mounted
+    # at /pypi to match PyPI's own convention (`PyPI.pypi_url`).
+    @app.post("/pypi")
+    @app.post("/pypi/", include_in_schema=False)
+    async def xmlrpc_search(request: Request) -> Response:
+        _, database, _, _ = _state(request)
+        # Anonymous callers see public projects; reader credentials (or better)
+        # also see private ones, matching /search.
+        credential = optional_reader(request)
+
+        # Read with a hard cap instead of trusting Content-Length, so an
+        # oversized body is never buffered into memory.
+        buffer = bytearray()
+        async for chunk in request.stream():
+            buffer += chunk
+            if len(buffer) > rpc.MAX_REQUEST_BYTES:
+                break
+
+        def run(query: rpc.SearchRequest) -> list[dict[str, str]]:
+            rows = database.search_project_hits(
+                name_terms=query.name_terms,
+                summary_terms=query.summary_terms,
+                include_private=credential is not None,
+            )
+            return rpc.select_hits(rows, query)
+
+        document = rpc.handle_request(bytes(buffer), run)
+        return Response(document, media_type="text/xml", headers={"Cache-Control": "no-store"})
 
     # -- first-time setup ----------------------------------------------------
 
@@ -722,6 +754,7 @@ async def _handle_upload(request: Request) -> Response:
                 size=size,
                 requires_python=info.requires_python,
                 packagetype=info.packagetype,
+                summary=info.summary,
             )
             database.touch_package(conn, package_id)
     finally:

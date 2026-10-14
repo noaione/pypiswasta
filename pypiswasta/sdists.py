@@ -27,6 +27,7 @@ from .distributions import (
     SDIST_EXTENSION,
     DistributionError,
     DistributionInfo,
+    parse_optional_core_metadata,
     reject_unsafe_filename,
 )
 
@@ -112,7 +113,7 @@ class _BudgetedReader(io.RawIOBase):
         raise io.UnsupportedOperation("_BudgetedReader is read-only")
 
 
-def _parse_pkg_info(data: bytes, name: str, version: str) -> str | None:
+def _parse_pkg_info(data: bytes, name: str, version: str) -> tuple[str | None, str]:
     try:
         message = email.message_from_bytes(data)
     except Exception as exc:  # pragma: no cover - defensive
@@ -132,10 +133,7 @@ def _parse_pkg_info(data: bytes, name: str, version: str) -> str | None:
     except InvalidVersion as exc:
         raise SdistError(f"invalid PKG-INFO Version: {meta_version!r}") from exc
 
-    requires_python = message.get("Requires-Python")
-    if requires_python is not None:
-        requires_python = requires_python.strip() or None
-    return requires_python
+    return parse_optional_core_metadata(message)
 
 
 def _check_member_name(member_name: str, stem: str) -> None:
@@ -190,11 +188,12 @@ def inspect_sdist(path: Path, filename: str) -> DistributionInfo:
     if metadata_bytes is None:
         raise SdistError(f"sdist has no {PKG_INFO} at {expected!r}")
 
-    requires_python = _parse_pkg_info(metadata_bytes, name, version)
+    requires_python, summary = _parse_pkg_info(metadata_bytes, name, version)
     return DistributionInfo(
         name=name,
         version=version,
         requires_python=requires_python,
+        summary=summary,
         metadata_bytes=metadata_bytes,
         packagetype=PACKAGETYPE_SDIST,
     )
