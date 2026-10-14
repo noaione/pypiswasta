@@ -36,10 +36,9 @@ sqlite_busy_timeout_ms = 5000
 [branding]
 # Product identity. Every key is optional; the values below are the defaults.
 #
-# `name` appears in page titles ("<page> — <name>"), in the index heading, in
-# the footer, and as the HTTP Basic realm that clients show in password
-# prompts. Changing it does not change any URL or JSON field, so existing
-# clients keep working.
+# `name` appears in page titles ("<page> — <name>"), in the index heading and
+# as the HTTP Basic realm that clients show in password prompts. Changing it
+# does not change any URL or JSON field, so existing clients keep working.
 name = "PyPISwasta"
 tagline = "A minimal wheel-only Python package index."
 # Extra HTML appended to the footer of every page. It is rendered exactly as

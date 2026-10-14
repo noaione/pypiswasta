@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from pypiswasta._metadata import __name__ as PROJECT_NAME  # ruff: ignore[lowercase-imported-as-non-lowercase]
 from pypiswasta._metadata import __version__
 from pypiswasta.app import create_app
 from pypiswasta.config import (
@@ -146,8 +147,8 @@ def test_accent_colours_reach_the_stylesheet(branded) -> None:
 def test_footer_html_is_inserted_verbatim(branded) -> None:
     page = branded.get("/").text
     assert page.count("<footer>") == 1
-    assert 'Powered with Acme Index v' in page
-    assert f'<a href="https://example.invalid/ops">ops</a>' in page
+    assert f"Powered with {PROJECT_NAME} v{__version__}" in page
+    assert '<a href="https://example.invalid/ops">ops</a>' in page
 
 
 def test_footer_stays_inside_the_content_container(branded) -> None:
@@ -162,18 +163,18 @@ def test_setup_page_carries_the_footer(tmp_path: Path) -> None:
     with TestClient(create_app(path)) as client:
         page = client.get("/setup").text
     assert "<title>First-time setup — Acme Index</title>" in page
-    assert "Powered with Acme Index v" in page
+    assert f"Powered with {PROJECT_NAME} v{__version__}" in page
 
 
 def test_empty_footer_leaves_only_the_attribution() -> None:
-    assert footer_text(BrandingConfig(name="Acme")) == f"Powered with Acme v{__version__}"
+    assert footer_text(BrandingConfig(name="Acme")) == f"Powered with {PROJECT_NAME} v{__version__}"
     assert "·" not in footer_text(BrandingConfig(name="Acme"))
 
 
 def test_footer_text_appends_custom_html() -> None:
     text = footer_text(BrandingConfig(name="Acme", footer="<b>hi</b>"))
     assert text.endswith("· <b>hi</b>")
-    assert "Powered with Acme v" in text
+    assert f"Powered with {PROJECT_NAME} v" in text
 
 
 def test_stylesheet_substitutes_both_accents() -> None:
@@ -202,7 +203,7 @@ def test_name_and_tagline_are_html_escaped(tmp_path: Path) -> None:
 
 
 def test_esc_handles_quotes_and_none() -> None:
-    assert esc('a"b\'c<d>&') == "a&quot;b&#x27;c&lt;d&gt;&amp;"
+    assert esc("a\"b'c<d>&") == "a&quot;b&#x27;c&lt;d&gt;&amp;"
     assert esc(None) == ""
 
 
@@ -228,6 +229,7 @@ def test_realm_falls_back_when_nothing_is_left() -> None:
 def test_name_with_quotes_does_not_break_the_challenge(tmp_path: Path) -> None:
     path = write_config(tmp_path, name='Ac"me')
     with TestClient(create_app(path)) as client:
+        assert client.post("/setup", data={"username": "admin"}).status_code == 200
         response = client.get("/private/simple/")
     assert response.status_code == 401
     assert response.headers["www-authenticate"] == 'Basic realm="Acme"'

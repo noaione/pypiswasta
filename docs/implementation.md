@@ -491,7 +491,7 @@ key is optional; the defaults reproduce the stock look.
 
 | Key | Default | Effect |
 | --- | --- | --- |
-| `name` | `PyPISwasta` | Page titles (`<page> — <name>`), the index `<h1>`, the footer, and the **HTTP Basic realm** shown in password prompts |
+| `name` | `PyPISwasta` | Page titles (`<page> — <name>`), the index `<h1>`, and the **HTTP Basic realm** shown in password prompts |
 | `tagline` | `A minimal wheel-only Python package index.` | Sub-heading on the index page and the default `<meta name="description">` |
 | `footer` | `""` | Extra HTML appended to the footer of every page |
 | `accent` | `#2b5cd9` | Accent colour, light theme |
@@ -500,8 +500,12 @@ key is optional; the defaults reproduce the stock look.
 `web.py` owns all of it: one `STYLESHEET` template with `__ACCENT__` and
 `__ACCENT_DARK__` placeholders, one `render_page()` shell that keeps the footer
 inside `<main>`, and page builders that take `branding` as a keyword argument.
-Every caller reaches them through `config.branding`, so there is no second
-source of truth for the product name.
+Every caller reaches them through `config.branding`.
+
+The footer is the one exception: its attribution credits the software, so the
+name comes from `_metadata.__name__` and the version from `_metadata.__version__`.
+A white-labelled instance therefore still declares what it is running, and
+`branding.footer` is appended after that attribution.
 
 The realm is derived rather than stored: `BrandingConfig.realm` drops
 non-printable characters and `"`/`\`, so a name containing a quote cannot break

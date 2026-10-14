@@ -315,7 +315,7 @@ upload_chunk_size_kb = {config.performance.upload_chunk_size_kb}
 sqlite_busy_timeout_ms = {config.performance.sqlite_busy_timeout_ms}
 
 [branding]
-# Shown in page titles, the index heading, the footer and the Basic auth realm.
+# Shown in page titles, the index heading and the Basic auth realm.
 name = {_toml_string(config.branding.name)}
 tagline = {_toml_string(config.branding.tagline)}
 # Extra HTML appended to the footer of every page, rendered exactly as written.

@@ -5,8 +5,9 @@ page builders. No template engine, no gradients, no build step.
 
 Product identity comes from the ``[branding]`` configuration section, so a
 deployment can look like its own: the name appears in page titles, the index
-heading, the footer and the HTTP Basic realm, and the accent colours theme the
-stylesheet. Everything interpolated here is HTML-escaped.
+heading and the HTTP Basic realm, the accent colours theme the stylesheet, and
+the ``footer`` setting appends operator HTML to every page footer. Everything
+interpolated here is HTML-escaped, except ``footer`` itself.
 """
 
 from __future__ import annotations
@@ -78,7 +79,7 @@ button.secondary { background: transparent; color: var(--accent); }
 .error { color: var(--danger); }
 .ok { color: var(--ok); }
 ul { padding-left: 1.2rem; }
-footer { margin-top: 2.5rem; color: var(--muted); font-size: .82rem; }
+footer { margin-top: 1rem; color: var(--muted); font-size: .82rem; }
 """  # ruff: ignore[line-too-long]
 
 
@@ -95,9 +96,11 @@ def stylesheet(branding: BrandingConfig) -> str:
 def footer_text(branding: BrandingConfig) -> str:
     """The attribution line shown at the bottom of every page.
 
-    ``branding.footer`` is appended to the attribution as-is: it comes from the
-    operator's own configuration file rather than from a request, so it is
-    deliberately not escaped and may contain markup.
+    The attribution credits the software, so the name comes from the package
+    metadata rather than from ``[branding]``. ``branding.footer`` is then
+    appended as-is: it comes from the operator's own configuration file rather
+    than from a request, so it is deliberately not escaped and may contain
+    markup.
     """
     attribution = f"Powered with {esc(PROJECT_NAME)} v{__version__}"
     if not branding.footer:
