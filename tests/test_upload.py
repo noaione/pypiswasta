@@ -31,6 +31,34 @@ def test_upload_requires_credentials(instance) -> None:
     assert instance.upload(wheel).status_code == 200
 
 
+def test_upload_accepts_both_trailing_slash_spellings(instance) -> None:
+    """`/legacy` and `/legacy/` must both reach the upload handler.
+
+    `redirect_slashes` is disabled, so the no-slash form has no Starlette
+    fallback -- and a redirect would require replaying the whole body.
+    """
+    wheel = build_wheel("noslash", "1.0.0")
+    response = instance.client.post(
+        "/legacy",
+        data={
+            ":action": "file_upload",
+            "protocol_version": "1",
+            "metadata_version": "2.1",
+            "name": "noslash",
+            "version": "1.0.0",
+            "filetype": "bdist_wheel",
+            "pyversion": "py3",
+        },
+        files={"file": (wheel_filename("noslash", "1.0.0"), wheel, "application/octet-stream")},
+        auth=instance.auth("upload"),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["sha256"] == hashlib.sha256(wheel).hexdigest()
+
+    # The canonical spelling must keep working too.
+    assert instance.upload(build_wheel("withslash", "1.0.0"), wheel_filename("withslash", "1.0.0")).status_code == 200
+
+
 def test_reader_role_cannot_upload(instance) -> None:
     response = instance.upload(build_wheel(), role="reader")
     assert response.status_code == 403

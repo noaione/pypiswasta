@@ -338,6 +338,12 @@ def _install_routes(app: FastAPI) -> None:
 
     # -- upload --------------------------------------------------------------
 
+    # Registered on both spellings rather than redirecting: `uv publish` and
+    # `twine upload` are configured with whichever form the operator typed, and
+    # a 307 would make the client replay the entire multipart body -- up to
+    # `max_upload_size_mb` -- to reach the same handler. `redirect_slashes` is
+    # off application-wide, so this is not covered by Starlette.
+    @app.post("/legacy", include_in_schema=False)
     @app.post("/legacy/")
     async def legacy_upload(request: Request, credential: UploadCredential) -> Response:
         return await _handle_upload(request)

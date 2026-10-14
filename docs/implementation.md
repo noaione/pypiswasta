@@ -456,7 +456,11 @@ unauthenticated.
 - **Trailing slashes** are redirected by explicit handlers that emit a *relative*
   `Location` with `307`; Starlette's own `redirect_slashes` is disabled so a
   redirect can never be built from an attacker-controlled `Host` header and
-  never drops `Authorization`.
+  never drops `Authorization`. The **upload endpoint is the one exception**: the
+  handler is registered on both `/legacy` and `/legacy/` instead, because
+  `uv publish` and `twine upload` use whichever spelling the operator configured
+  and a `307` would make the client replay the entire multipart body to reach the
+  same view.
 - **`HEAD` is registered explicitly.** Current FastAPI does not add `HEAD` to a
   `GET` route, so index and file routes use `methods=["GET", "HEAD"]`.
 - **Empty projects** (zero artifacts after deletions) are hidden: omitted from
