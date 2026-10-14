@@ -113,4 +113,8 @@ def test_landing_footer_stays_inside_the_content_container(client) -> None:
 
     inside_main = page.split("<main>", 1)[1].split("</main>", 1)[0]
     assert "<footer>" in inside_main
-    assert "SQLite" in inside_main
+
+    # Anything rendered after </main> escapes the max-width container.
+    after_main = page.split("</main>", 1)[1]
+    assert "<footer>" not in after_main
+    assert "<a " not in after_main

@@ -141,7 +141,7 @@ private: /private/simple/</pre>
   <li><code>GET /api/admin/packages</code> &mdash; admin package listing</li>
   <li><a href="/healthz">/healthz</a></li>
 </ul>"""
-        footer = f"""Powered with <a href="https://github.com/noaione/pypiswasta">PyPISwasta</a> v{__version__}"""
+        footer = f"""Powered with PyPISwasta v{__version__}"""
     else:
         body = """<h1>PyPISwasta</h1>
 <p class="muted">This instance has not been set up yet.</p>

@@ -20,6 +20,7 @@ import binascii
 import functools
 import hashlib
 import hmac
+import re
 import secrets
 from dataclasses import dataclass
 from typing import Any, Iterable, Protocol
@@ -49,6 +50,24 @@ ALLOWED_ROLES: dict[str, frozenset[str]] = {
 DEFAULT_USERNAMES = {"admin": "admin", "upload": "publisher", "reader": "reader"}
 
 MIN_PASSWORD_LENGTH = 8
+
+# HTTP Basic splits the credential on the first colon, so a colon can never be
+# part of a username. Keep the alphabet tight and reject anything else outright.
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9._@+-]{1,64}$")
+USERNAME_RULE = "1-64 characters using letters, digits, or . _ @ + -"
+
+
+class UsernameError(ValueError):
+    """Raised when a credential username cannot be used in HTTP Basic auth."""
+
+
+def validate_username(value: str) -> str:
+    """Trim and validate a username, raising :class:`UsernameError` if unusable."""
+    username = (value or "").strip()
+    if not USERNAME_PATTERN.match(username):
+        raise UsernameError(f"Username must be {USERNAME_RULE}")
+    return username
+
 
 _hasher = PasswordHasher()
 

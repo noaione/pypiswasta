@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -21,8 +22,10 @@ from . import __version__
 from .auth import (
     DEFAULT_USERNAMES,
     MIN_PASSWORD_LENGTH,
+    UsernameError,
     build_credential,
     generate_credential,
+    validate_username,
 )
 from .config import (
     DEFAULT_CONFIG_PATH,
@@ -160,16 +163,35 @@ def _cmd_auth_set_username(args: argparse.Namespace) -> int:
     if existing is None:
         print(f"error: no {role} credential is configured", file=sys.stderr)
         return 1
-    with database.write() as conn:
-        database.upsert_credential(
-            conn,
-            role=role,
-            username=args.username,
-            algorithm=existing["algorithm"],
-            password_hash=existing["password_hash"],
+
+    try:
+        username = validate_username(args.username)
+    except UsernameError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if existing["username"] == username:
+        print(f"{role} username is already {username}")
+        return 0
+
+    try:
+        with database.write() as conn:
+            database.upsert_credential(
+                conn,
+                role=role,
+                username=username,
+                algorithm=existing["algorithm"],
+                password_hash=existing["password_hash"],
+            )
+    except sqlite3.IntegrityError:
+        print(
+            f"error: username {username!r} is already used by another role",
+            file=sys.stderr,
         )
-    print(f"{role} username set to {args.username}")
-    print("restart the PyPISwasta service to make this take effect")
+        return 1
+
+    print(f"{role} username set to {username}")
+    print("update any client that saved the old username, then restart the service")
     return 0
 
 

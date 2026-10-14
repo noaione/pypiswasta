@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import re
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import unquote
@@ -26,10 +25,12 @@ from . import simple, web
 from .auth import (
     AuthStore,
     Credential,
+    UsernameError,
     generate_credential,
     require_admin,
     require_reader,
     require_upload,
+    validate_username,
 )
 from .config import DEFAULT_CONFIG_PATH, Config, load_config
 from .db import Database
@@ -53,8 +54,6 @@ CACHE_PUBLIC_INDEX = "no-cache, must-revalidate"
 CACHE_PRIVATE_INDEX = "private, no-store"
 CACHE_PUBLIC_FILE = "no-cache, must-revalidate"
 CACHE_PRIVATE_FILE = "private, no-store"
-
-_USERNAME_RE = re.compile(r"^[A-Za-z0-9._@+-]{1,64}$")
 
 SETUP_EXEMPT_PATHS = frozenset({"/setup", "/healthz", "/favicon.ico"})
 
@@ -263,12 +262,11 @@ def _install_routes(app: FastAPI) -> None:
             return RedirectResponse("/", status_code=303)
 
         form = await request.form()
-        username = str(form.get("username") or "").strip()
-        if not _USERNAME_RE.match(username):
-            return web.setup_page(
-                error=("Username must be 1-64 characters using letters, digits, or . _ @ + -"),
-                username=username or "admin",
-            )
+        raw_username = str(form.get("username") or "").strip()
+        try:
+            username = validate_username(raw_username)
+        except UsernameError as exc:
+            return web.setup_page(error=str(exc), username=raw_username or "admin")
 
         # No password is collected here: every credential is a freshly generated
         # 256-bit secret that is shown exactly once.

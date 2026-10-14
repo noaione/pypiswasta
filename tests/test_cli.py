@@ -248,3 +248,43 @@ def test_auth_reset_password_rejects_unknown_role(tmp_path: Path) -> None:
         assert exc.code == 2
     else:  # pragma: no cover - defensive
         raise AssertionError("invalid role must be rejected by argparse")
+
+
+def test_auth_set_username_validates_and_detects_collisions(tmp_path: Path, capsys) -> None:
+    config = _init(tmp_path)
+    assert main(["auth", "reset-password", "reader", "--config", config]) == 0
+    assert main(["auth", "reset-password", "upload", "--config", config]) == 0
+    capsys.readouterr()
+
+    # A colon would make HTTP Basic authentication impossible for this role.
+    assert main(["auth", "set-username", "upload", "bad:name", "--config", config]) == 1
+    assert "Username must be" in capsys.readouterr().err
+
+    assert main(["auth", "set-username", "upload", "has space", "--config", config]) == 1
+    capsys.readouterr()
+
+    # Colliding with another role must fail cleanly instead of raising.
+    assert main(["auth", "set-username", "upload", "reader", "--config", config]) == 1
+    assert "already used by another role" in capsys.readouterr().err
+
+    # A rejected change leaves every stored credential untouched.
+    assert main(["auth", "list", "--config", config]) == 0
+    listed = capsys.readouterr().out
+    assert "upload\tpublisher" in listed
+    assert "reader\treader" in listed
+
+
+def test_auth_set_username_succeeds(tmp_path: Path, capsys) -> None:
+    config = _init(tmp_path)
+    assert main(["auth", "reset-password", "upload", "--config", config]) == 0
+    capsys.readouterr()
+
+    assert main(["auth", "set-username", "upload", "ci-bot", "--config", config]) == 0
+    assert "ci-bot" in capsys.readouterr().out
+
+    assert main(["auth", "list", "--config", config]) == 0
+    assert "upload\tci-bot" in capsys.readouterr().out
+
+    # Setting it again is a no-op rather than an error.
+    assert main(["auth", "set-username", "upload", "ci-bot", "--config", config]) == 0
+    assert "already" in capsys.readouterr().out
