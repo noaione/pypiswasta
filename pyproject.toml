@@ -1,0 +1,127 @@
+[project]
+name = "pypiswasta"
+version = "0.1.0"
+description = "Private PyPI server with some additional bell-and-whistle"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.143.0",
+    "granian>=2.8.4",
+    "packaging>=26.3",
+    "python-multipart>=0.0.32",
+    "argon2-cffi>=25.1.0",
+]
+
+[project.scripts]
+pypiswasta = "pypiswasta.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pypiswasta"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "httpx>=0.28.1",
+    "ruff>=0.17.0"
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+
+[tool.ruff]
+line-length = 120
+extend-exclude = [
+    "env",
+    "venv",
+    ".pytest_cache",
+    ".venv",
+    "__pycache__",
+    ".git",
+    ".mypy_cache",
+    ".vscode",
+    ".ruff_cache",
+    "**/Lib/**",
+    "dist",
+    "build",
+    "_templates",
+    "tools",
+]
+target-version = "py310"
+src = ["pypiswasta", "tests", "ci"]
+
+[tool.ruff.format]
+preview = true
+indent-style = "space"
+quote-style = "double"
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "W",
+    "I",
+    "N",
+    "S",
+    "B",
+    "T",
+    "Q",
+    "D",
+    "RUF",
+    "COM",
+    "PTH",
+    "ASYNC"
+]
+ignore = [
+    "whitespace-before-punctuation",
+    "undefined-local-with-import-star-usage",
+    "undefined-local-with-import-star",
+    "forward-annotation-syntax-error",
+    "non-lowercase-variable-in-function",
+    "missing-trailing-comma",
+    "missing-trailing-period",  # first line should be period, most of my docstring will be LICENSE header so no thanks
+    "blank-line-after-function",
+    "non-imperative-mood",
+    "unused-async",
+    "CPY",
+]
+preview = true
+extend-ignore = ["D", "subprocess-without-shell-equals-true", "suspicious-subprocess-import", "print"] # D -> Docstring missing for public function or method
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+ignore-decorators = ["typing.overload"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = false
+split-on-trailing-comma = true
+required-imports = ["from __future__ import annotations"]
+known-first-party = ["tests", "pypiswasta"]
+section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["unused-import", "undefined-local-with-import-star", "missing-required-import", "missing-blank-line-after-summary"]
+"tests/*.py" = ["assert", "missing-required-import", "D"]  # assert statement used in pytest
+"pipelines/*" = ["T", "I", "subprocess-without-shell-equals-true", "D"]
+"tools/*.py" = ["undocumented-public-module", "print", "missing-required-import"]
+
+[tool.pyright]
+exclude = [
+    ".vscode/*",
+    "tests/*",
+    "_templates/**/*",
+    "build/**/*",
+    "dist",
+    ".venv",
+    "venv",
+    "env",
+    "**/Lib/**",
+    "**/node_modules/**",
+    "**/__pycache__",
+    "**/.*"
+]

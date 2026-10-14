@@ -1,0 +1,34 @@
+# PyPISwasta example configuration.
+#
+# Copy to /etc/pypiswasta/config.toml, adjust the paths, and make it readable
+# only by the service account (chmod 0600 is set automatically by
+# `pypiswasta init`).
+#
+# There is NO [authentication] section. Credentials live in the SQLite database
+# and are created through the one-time setup page on first boot. The setup page
+# asks for the administrator username only; all three passwords are generated
+# automatically and shown exactly once.
+
+[server]
+# Bind to loopback and let Caddy (or another proxy) terminate TLS.
+host = "127.0.0.1"
+port = 8374
+# Keep at 1: the app is single-process by design and caches credentials in memory.
+workers = 1
+
+[storage]
+# Holds objects/, metadata/ and tmp/. The database may live elsewhere.
+data_dir = "/var/lib/pypiswasta"
+database = "/var/lib/pypiswasta/packages.db"
+max_upload_size_mb = 1024
+
+[repository]
+# Newly created projects are private unless this is "public".
+default_visibility = "private"
+# When false, re-uploading an existing filename with different bytes returns 409.
+allow_overwrite = true
+
+[performance]
+# Chunk size used while streaming an upload to disk and hashing it.
+upload_chunk_size_kb = 1024
+sqlite_busy_timeout_ms = 5000
