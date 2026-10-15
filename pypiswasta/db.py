@@ -108,15 +108,17 @@ def _iter_statements(script: str) -> Iterator[str]:
     whole migration -- schema changes *and* the version stamp -- in one
     transaction.
     """
-    buffer = ""
-    for line in script.splitlines(keepends=True):
-        buffer += line
-        if sqlite3.complete_statement(buffer):
-            if buffer.strip():
-                yield buffer.strip()
-            buffer = ""
-    if buffer.strip():
-        yield buffer.strip()
+    start = 0
+    for index, character in enumerate(script):
+        if character == ";":
+            statement = script[start : index + 1]
+            # SQLite distinguishes statement endings from semicolons inside
+            # strings, comments, or a trigger's BEGIN ... END body.
+            if sqlite3.complete_statement(statement):
+                yield statement.strip()
+                start = index + 1
+    if tail := script[start:].strip():
+        yield tail
 
 
 def _apply_statement(conn: sqlite3.Connection, statement: str) -> None:
@@ -212,6 +214,7 @@ class Database:
         )
         conn.row_factory = sqlite3.Row
         conn.isolation_level = None  # explicit transactions
+        conn.create_function("unicode_casefold", 1, str.casefold, deterministic=True)
         conn.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
@@ -382,12 +385,12 @@ class Database:
             clauses.append("p.name LIKE ? ESCAPE '\\'")
             params.append(_like_pattern(normalized))
         for term in summary_terms:
-            # SQLite's LIKE is case-insensitive for ASCII, which is what a
-            # human-typed summary search needs.
-            text = (term or "").strip().lower()
+            # SQLite's built-in LIKE only handles ASCII case differences, so
+            # fold both sides with the same Unicode rules as the final matcher.
+            text = (term or "").strip().casefold()
             if not text:
                 continue
-            clauses.append("a.summary LIKE ? ESCAPE '\\'")
+            clauses.append("unicode_casefold(a.summary) LIKE ? ESCAPE '\\'")
             params.append(_like_pattern(text))
         if not clauses:
             return []

@@ -587,6 +587,53 @@ def test_non_ascii_summary_publishes_and_is_searchable(instance) -> None:
     assert [(hit["name"], hit["summary"]) for hit in found] == [("demo", summary)]
 
 
+@pytest.mark.parametrize(
+    ("summary", "query"),
+    [
+        ("CAFÉ utilities", "café"),
+        ("café utilities", "CAFÉ"),
+        ("ПРИВЕТ мир", "привет"),
+        ("привет мир", "ПРИВЕТ"),
+        ("Straße tools", "STRASSE"),
+        ("STRASSE tools", "straße"),
+        # Greek final-sigma case folding.
+        ("ΟΣ εργαλεία", "οσ"),  # ruff: ignore[ambiguous-unicode-character-string]
+    ],
+)
+def test_unicode_summary_case_variants_match_and_preserve_spelling(instance, summary, query) -> None:
+    publish(instance, "unicodeproject", summary=summary)
+    response = call(instance.client, [{"summary": [query]}, "or"])
+    assert response.status_code == 200
+    assert hits(response) == [{"name": "unicodeproject", "version": "1.0.0", "summary": summary}]
+
+
+def test_unicode_summary_matching_preserves_visibility_and_operators(instance) -> None:
+    summary = "CAFÉ ПРИВЕТ utilities"
+    publish(instance, "secret", summary=summary, public=False)
+
+    for operator, terms in (("and", ["café", "привет"]), ("or", ["café", "absent"])):
+        params = [{"summary": terms}, operator]
+        assert hits(call(instance.client, params)) == []
+        for role in ("reader", "admin"):
+            response = call(instance.client, params, auth=instance.auth(role))
+            assert hits(response) == [{"name": "secret", "version": "1.0.0", "summary": summary}]
+    missing = call(instance.client, [{"summary": ["café", "absent"]}, "and"], auth=instance.auth("reader"))
+    assert hits(missing) == []
+
+
+def test_unicode_summary_normalization_deduplicates_equivalent_terms() -> None:
+    request = rpc.parse_search([{"summary": ["Straße", "STRASSE", "straße"]}, "and"])
+    assert request.summary_terms == ("Straße",)
+
+
+def test_unicode_summary_matching_keeps_wildcards_literal(instance) -> None:
+    summary = "CAFÉ 100% A_B C\\D"
+    publish(instance, "literal", summary=summary)
+    publish(instance, "decoy", summary="CAFÉ 100X A-B C/D")
+    response = call(instance.client, [{"summary": ["café 100% a_b c\\d"]}, "or"])
+    assert hits(response) == [{"name": "literal", "version": "1.0.0", "summary": summary}]
+
+
 # --------------------------------------------------------------------------- #
 # query budget
 # --------------------------------------------------------------------------- #

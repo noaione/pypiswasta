@@ -134,11 +134,11 @@ def parse_search(params: list[Any]) -> SearchRequest:
 
     # Every entry in these two lists becomes one SQL ``OR`` clause, so collapse
     # the duplicates that would only spend expression depth. Names are compared
-    # through ``canonicalize_name`` and summaries in lowercase, so each list is
-    # deduplicated exactly the way its SQL clause compares values -- a repeated
-    # term is then free, and only *distinct* terms count against the budget.
+    # through ``canonicalize_name`` and summaries with Unicode case folding.
+    # Each list is deduplicated exactly the way its SQL clause compares values
+    # -- a repeated term is free, and only *distinct* terms count against the budget.
     name_terms = _dedupe(name_terms, canonicalize_name)
-    summary_terms = _dedupe(summary_terms, str.lower)
+    summary_terms = _dedupe(summary_terms, str.casefold)
     if len(name_terms) + len(summary_terms) > MAX_TERMS:
         raise XmlRpcError(INVALID_PARAMS, f"at most {MAX_TERMS} distinct search terms are supported")
 
@@ -158,12 +158,13 @@ def _matches(term: str, name: str, summaries: list[str]) -> bool:
 
     ``term`` is already lowercased. The name is compared through
     :func:`canonicalize_name` so that ``my_pkg`` finds ``my-pkg``; summaries are
-    free text, so they are matched literally and case-insensitively.
+    free text, so they are matched literally after Unicode case folding.
     """
     normalized = canonicalize_name(term)
     if normalized and normalized in name:
         return True
-    return any(term in summary for summary in summaries)
+    folded_term = term.casefold()
+    return any(folded_term in summary for summary in summaries)
 
 
 def select_hits(rows: Iterable[_Row], request: SearchRequest) -> list[dict[str, str]]:
@@ -184,7 +185,8 @@ def select_hits(rows: Iterable[_Row], request: SearchRequest) -> list[dict[str, 
         version = str(row["version"])
         summary = str(row["summary"] or "")
 
-        results = [_matches(term, name, [summary.lower()]) for term in request.terms]
+        folded_summaries = [summary.casefold()]
+        results = [_matches(term, name, folded_summaries) for term in request.terms]
         matched = any(results) if request.operator == "or" else all(results)
         if not matched:
             continue

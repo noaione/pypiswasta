@@ -105,6 +105,50 @@ def test_migrate_is_idempotent(tmp_path: Path) -> None:
     database.close()
 
 
+@pytest.mark.parametrize(
+    ("script", "expected"),
+    [
+        (
+            "CREATE TABLE migration_values (value TEXT); INSERT INTO migration_values VALUES ('same-line');",
+            "same-line",
+        ),
+        (
+            "CREATE TABLE migration_values (\nvalue TEXT\n);\nINSERT INTO migration_values\nVALUES ('multiline');",
+            "multiline",
+        ),
+        (
+            "CREATE TABLE migration_values (value TEXT);\nINSERT INTO migration_values VALUES ('it''s; intact');",
+            "it's; intact",
+        ),
+        (
+            "-- A comment; not a statement\nCREATE TABLE migration_values (value TEXT); /* comment;\n"
+            "; */ INSERT INTO migration_values VALUES ('comments'); -- trailing; comment",
+            "comments",
+        ),
+        (
+            "CREATE TABLE migration_values (value TEXT);\nCREATE TABLE source (value TEXT);\n"
+            "CREATE TRIGGER record_value AFTER INSERT ON source BEGIN\n"
+            "INSERT INTO migration_values VALUES (NEW.value);\n"
+            "UPDATE migration_values SET value = value || ';trigger';\nEND;\n"
+            "INSERT INTO source VALUES ('first;second');",
+            "first;second;trigger",
+        ),
+    ],
+    ids=["same-line", "multiline", "quoted-semicolon", "comments", "trigger"],
+)
+def test_migration_statements_are_independent_of_line_breaks(tmp_path: Path, monkeypatch, script, expected) -> None:
+    database = Database(tmp_path / "statements.db")
+    try:
+        database.migrate()
+        target = SCHEMA_VERSION + 1
+        monkeypatch.setattr(db_module, "MIGRATIONS", (*db_module.MIGRATIONS, (target, script)))
+        database.migrate()
+        assert database.schema_version == target
+        assert database.conn.execute("SELECT value FROM migration_values").fetchone()[0] == expected
+    finally:
+        database.close()
+
+
 def test_upgraded_database_accepts_a_new_artifact(tmp_path: Path) -> None:
     """The added columns must be writable, not just present."""
     path = tmp_path / "v1.db"
@@ -199,7 +243,7 @@ def test_failed_migration_rolls_back_completely(tmp_path: Path, monkeypatch) -> 
 
     broken = (
         SCHEMA_VERSION + 1,
-        "CREATE TABLE partial (id INTEGER);\nINSERT INTO no_such_table VALUES (1);",
+        "CREATE TABLE partial (id INTEGER); INSERT INTO no_such_table VALUES (1);",
     )
     monkeypatch.setattr(db_module, "MIGRATIONS", (*db_module.MIGRATIONS, broken))
 

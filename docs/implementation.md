@@ -717,8 +717,13 @@ Protocol details:
   current versions; a project found only through a summary reports just the
   versions whose summary matched.
 - Name terms are compared through `canonicalize_name()`, so `my_package` finds
-  `my-package`; summary terms are plain case-insensitive substrings. `or` keeps a
-  version when any term matches, `and` requires every term — and because pip sends
+  `my-package`; summary terms are literal substrings after Unicode case folding.
+  Every database connection registers `unicode_casefold()`, applying Python's
+  `str.casefold()` to stored summaries in the SQL prefilter. Query normalization,
+  deduplication and the final Python matcher use the same folding rules, so SQL
+  does not discard Unicode case variants before matching. Returned summaries
+  retain their original spelling. `or` keeps a version when any term matches,
+  `and` requires every term — and because pip sends
   the same words under both `name` and `summary`, the terms are collapsed with
   `dict.fromkeys()` before the operator is applied, so `and` does not silently
   demand two matches for one word.
@@ -729,8 +734,8 @@ Protocol details:
   cap while overflowing SQLite's expression-depth limit — an exception that
   escaped the fault handling as an HTTP 500. Both criteria lists are deduplicated
   the way their own SQL comparison treats them (`canonicalize_name()` for names,
-  lowercase for summaries), so a repeated term costs nothing and only distinct
-  terms count against the budget.
+  Unicode case folding for summaries), so a repeated term costs nothing and only
+  distinct terms count against the budget.
 - The whole `rpc.handle_request()` call runs in a worker thread
   (`anyio.to_thread.run_sync`). This is the one **async** route in the
   application, so without that its XML parsing and its SQLite query would block
@@ -781,7 +786,10 @@ upload re-installs a fresh object.
   ahead of the recorded version. `executescript()` is deliberately **not** used
   for this -- it commits any pending transaction before it runs, which is why an
   outer `BEGIN` alone would not protect it. Scripts are split into statements
-  with `sqlite3.complete_statement` and executed one at a time.
+  at semicolon boundaries, using `sqlite3.complete_statement` to distinguish
+  statement endings from semicolons in quoted strings, comments and trigger
+  bodies, then executed one at a time. Multiple statements on one line work
+  without changing the transaction boundary.
 - **Recovers** a database left partially migrated by an older release: a
   statement failing with "duplicate column name" is skipped, so re-running the
   script finishes the remaining steps and stamps the version.
