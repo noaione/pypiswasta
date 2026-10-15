@@ -9,7 +9,6 @@ any of it is trusted. Source distributions are handled by
 
 from __future__ import annotations
 
-import email.message
 import zipfile
 import zlib
 from pathlib import Path
@@ -23,6 +22,8 @@ from .distributions import (
     DistributionError,
     DistributionInfo,
     UploadTooLargeError,
+    header_text,
+    parse_core_metadata,
     parse_optional_core_metadata,
     reject_unsafe_filename,
     stage_upload,
@@ -56,15 +57,22 @@ WheelInfo = DistributionInfo
 
 
 def parse_wheel_filename_strict(filename: str) -> tuple[str, str]:
-    """Validate a wheel filename and return ``(normalized_name, version)``."""
+    """Validate a wheel filename and return ``(normalized_name, version)``.
+
+    ``parse_wheel_filename`` checks the *wheel* filename grammar, which does not
+    by itself promise a usable project name. ``validate=True`` applies the
+    project-name character rules too, so any name that reaches the index is one
+    that can be placed in a URL path component without further escaping.
+    """
     reject_unsafe_filename(filename, WheelError)
     if not filename.endswith(WHEEL_EXTENSION):
         raise WheelError("not a wheel: expected a .whl file")
     try:
         name, version, _build, _tags = parse_wheel_filename(filename)
+        normalized = canonicalize_name(name, validate=True)
     except ValueError as exc:
         raise WheelError(f"invalid wheel filename: {exc}") from exc
-    return canonicalize_name(name), str(version)
+    return normalized, str(version)
 
 
 def _validate_members(infos: list[zipfile.ZipInfo]) -> None:
@@ -133,12 +141,12 @@ def _read_member_bounded(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> byt
 
 def _parse_core_metadata(data: bytes, name: str, version: str) -> tuple[str | None, str]:
     try:
-        message = email.message_from_bytes(data)
+        message = parse_core_metadata(data)
+        meta_name = header_text(message, "Name")
+        meta_version = header_text(message, "Version")
     except Exception as exc:  # pragma: no cover - defensive
         raise WheelError(f"cannot parse core metadata: {exc}") from exc
 
-    meta_name = message.get("Name")
-    meta_version = message.get("Version")
     if not meta_name:
         raise WheelError("core metadata is missing the Name field")
     if not meta_version:

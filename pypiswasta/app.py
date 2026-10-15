@@ -200,7 +200,7 @@ def _file_entries(artifacts, *, prefix: str) -> list[simple.FileEntry]:
     return [
         simple.FileEntry(
             filename=row["filename"],
-            url=f"{prefix}/files/{row['sha256']}/{row['filename']}",
+            url=f"{prefix}/files/{row['sha256']}/{simple.path_component(row['filename'])}",
             sha256=row["sha256"],
             metadata_sha256=row["metadata_sha256"],
             requires_python=row["requires_python"],
@@ -344,7 +344,10 @@ def _install_routes(app: FastAPI) -> None:
             )
             return rpc.select_hits(rows, query)
 
-        document = rpc.handle_request(bytes(buffer), run)
+        # Both the XML parsing above and the SQL below are blocking, and this is
+        # an async route, so the whole call runs in a worker thread instead of
+        # stalling the event loop that serves every other request.
+        document = await anyio.to_thread.run_sync(rpc.handle_request, bytes(buffer), run)
         return Response(document, media_type="text/xml", headers={"Cache-Control": "no-store"})
 
     # -- first-time setup ----------------------------------------------------

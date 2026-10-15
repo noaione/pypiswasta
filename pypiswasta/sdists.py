@@ -12,7 +12,6 @@ current code happening never to unpack anything.
 
 from __future__ import annotations
 
-import email
 import gzip
 import io
 from collections.abc import Buffer
@@ -27,6 +26,8 @@ from .distributions import (
     SDIST_EXTENSION,
     DistributionError,
     DistributionInfo,
+    header_text,
+    parse_core_metadata,
     parse_optional_core_metadata,
     reject_unsafe_filename,
 )
@@ -46,15 +47,22 @@ class SdistError(DistributionError):
 
 
 def parse_sdist_filename_strict(filename: str) -> tuple[str, str]:
-    """Validate an sdist filename and return ``(normalized_name, version)``."""
+    """Validate an sdist filename and return ``(normalized_name, version)``.
+
+    ``parse_sdist_filename`` splits and normalizes the name but does not check
+    the project-name character rules, so a name such as ``bad#name`` would be
+    accepted and later inserted into index URL path components unencoded.
+    ``validate=True`` rejects reserved characters at the door instead.
+    """
     reject_unsafe_filename(filename, SdistError)
     if not filename.endswith(SDIST_EXTENSION):
         raise SdistError(f"not a source distribution: expected a {SDIST_EXTENSION} file")
     try:
         name, version = parse_sdist_filename(filename)
+        normalized = canonicalize_name(name, validate=True)
     except ValueError as exc:
         raise SdistError(f"invalid sdist filename: {exc}") from exc
-    return canonicalize_name(name), str(version)
+    return normalized, str(version)
 
 
 class _BudgetedReader(io.RawIOBase):
@@ -115,12 +123,12 @@ class _BudgetedReader(io.RawIOBase):
 
 def _parse_pkg_info(data: bytes, name: str, version: str) -> tuple[str | None, str]:
     try:
-        message = email.message_from_bytes(data)
+        message = parse_core_metadata(data)
+        meta_name = header_text(message, "Name")
+        meta_version = header_text(message, "Version")
     except Exception as exc:  # pragma: no cover - defensive
         raise SdistError(f"cannot parse PKG-INFO: {exc}") from exc
 
-    meta_name = message.get("Name")
-    meta_version = message.get("Version")
     if not meta_name:
         raise SdistError("PKG-INFO is missing the Name field")
     if not meta_version:

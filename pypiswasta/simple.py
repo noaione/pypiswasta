@@ -15,6 +15,7 @@ from __future__ import annotations
 import html
 import json
 from dataclasses import dataclass
+from urllib.parse import quote
 
 from packaging.version import InvalidVersion, Version
 
@@ -45,6 +46,16 @@ class FileEntry:
 
 def esc(value: object) -> str:
     return html.escape("" if value is None else str(value), quote=True)
+
+
+def path_component(value: str) -> str:
+    """Percent-encode one URL path segment, reserved characters included.
+
+    HTML escaping is not enough for something used as a URL: ``#``, ``?`` and
+    ``%`` survive it, and the client would read them as a fragment, a query
+    string and an escape marker rather than as part of the path.
+    """
+    return quote(value, safe="")
 
 
 # --------------------------------------------------------------------------- #
@@ -147,7 +158,9 @@ def negotiate(accept: str | None) -> Negotiated:
 
 
 def render_root_html(names: list[str], *, prefix: str = "") -> str:
-    links = "\n".join(f'    <a href="{esc(prefix)}/simple/{esc(name)}/">{esc(name)}</a><br />' for name in names)
+    links = "\n".join(
+        f'    <a href="{esc(prefix)}/simple/{esc(path_component(name))}/">{esc(name)}</a><br />' for name in names
+    )
     return (
         "<!DOCTYPE html>\n"
         "<html>\n"

@@ -35,6 +35,12 @@ def test_parses_sdist_filenames() -> None:
     assert parse_sdist_filename_strict("demo-1.0.0.tar.gz") == ("demo", "1.0.0")
 
 
+def test_accepts_letters_digits_dots_underscores_and_hyphens() -> None:
+    """The characters a project name is allowed to contain must still pass."""
+    assert parse_sdist_filename_strict("My_Package.v2-beta-1.2.3.tar.gz") == ("my-package-v2-beta", "1.2.3")
+    assert parse_sdist_filename_strict("demo-1.0.0.tar.gz") == ("demo", "1.0.0")
+
+
 @pytest.mark.parametrize(
     "filename",
     [
@@ -45,6 +51,11 @@ def test_parses_sdist_filenames() -> None:
         "../demo-1.0.0.tar.gz",
         "sub/demo-1.0.0.tar.gz",
         "",
+        # Reserved URL characters: accepting these produced index links that
+        # browsers read as a fragment, a query string or an escape sequence.
+        "bad#name-1.0.0.tar.gz",
+        "bad?name-1.0.0.tar.gz",
+        "bad%20name-1.0.0.tar.gz",
     ],
 )
 def test_rejects_unusable_sdist_filenames(filename: str) -> None:

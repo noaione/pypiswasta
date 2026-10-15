@@ -4,6 +4,7 @@ import hashlib
 import json
 
 from conftest import build_wheel, wheel_filename, wheel_metadata_bytes
+from pypiswasta import simple, web
 
 JSON_MEDIA = "application/vnd.pypi.simple.v1+json"
 HTML_MEDIA = "application/vnd.pypi.simple.v1+html"
@@ -299,3 +300,33 @@ def test_missing_trailing_slash_redirects(instance) -> None:
     # Following the redirect keeps the request inside the same namespace.
     followed = instance.client.get("/private/simple/demo", auth=instance.auth("reader"))
     assert followed.status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# URL encoding
+# --------------------------------------------------------------------------- #
+
+
+def test_index_links_percent_encode_the_name() -> None:
+    """HTML escaping alone leaves ``#``, ``?`` and ``%`` meaning something else."""
+    assert web.project_url("bad#name") == "/simple/bad%23name/"
+    assert web.project_url("bad?name", private=True) == "/private/simple/bad%3Fname/"
+    assert 'href="/simple/bad%23name/"' in simple.render_root_html(["bad#name"])
+
+
+def test_file_urls_encode_reserved_characters_and_still_download(instance) -> None:
+    """A local version puts ``+`` in the filename, so the URL has to encode it."""
+    wheel = build_wheel("demo", "1.0+local")
+    filename = "demo-1.0+local-py3-none-any.whl"
+
+    response = instance.upload(wheel, filename)
+    assert response.status_code == 200, response.text
+    digest = response.json()["sha256"]
+
+    index = instance.client.get("/private/simple/demo/", headers={"Accept": JSON_MEDIA}, auth=instance.auth("reader"))
+    url = json.loads(index.text)["files"][0]["url"]
+    assert url == f"/private/files/{digest}/demo-1.0%2Blocal-py3-none-any.whl"
+
+    download = instance.client.get(url, auth=instance.auth("reader"))
+    assert download.status_code == 200
+    assert download.content == wheel

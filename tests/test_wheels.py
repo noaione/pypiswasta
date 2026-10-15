@@ -56,6 +56,24 @@ def test_rejects_bad_filenames(filename: str) -> None:
         parse_wheel_filename_strict(filename)
 
 
+def test_accepts_the_allowed_project_name_characters() -> None:
+    assert parse_wheel_filename_strict("My_Package.v2-1.2.3-py3-none-any.whl") == ("my-package-v2", "1.2.3")
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        # Reserved URL characters would end up in the index links unencoded.
+        "bad#name-1.0.0-py3-none-any.whl",
+        "bad?name-1.0.0-py3-none-any.whl",
+        "bad%20name-1.0.0-py3-none-any.whl",
+    ],
+)
+def test_rejects_reserved_characters_in_the_name(filename: str) -> None:
+    with pytest.raises(WheelError):
+        parse_wheel_filename_strict(filename)
+
+
 def test_rejects_corrupt_archive(tmp_path: Path) -> None:
     path = tmp_path / "staged.whl"
     path.write_bytes(b"this is definitely not a zip file")

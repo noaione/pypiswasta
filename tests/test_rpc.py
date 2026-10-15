@@ -291,7 +291,7 @@ def test_authentication_is_offloaded_from_the_event_loop(instance, monkeypatch) 
     real_handle_request = rpc.handle_request
 
     def spy_handle_request(document, run):
-        seen["loop_thread"] = threading.get_ident()
+        seen["handle_thread"] = threading.get_ident()
         return real_handle_request(document, run)
 
     def spy_verify_argon2(stored, password):
@@ -301,12 +301,19 @@ def test_authentication_is_offloaded_from_the_event_loop(instance, monkeypatch) 
     monkeypatch.setattr(rpc, "handle_request", spy_handle_request)
     monkeypatch.setattr(auth_module, "verify_argon2", spy_verify_argon2)
 
+    # ``TestClient`` runs the application in its own event-loop thread, so asking
+    # the portal for a thread id gives the thread a blocking call would stall.
+    portal = instance.client.portal
+    assert portal is not None, "the test client must expose its event-loop portal"
+    loop_thread = portal.call(threading.get_ident)
+
     response = pypi_search(instance, "demo", auth=("root", "whatever"))
 
     assert response.status_code == 200
-    assert "loop_thread" in seen and "auth_thread" in seen
-    # The KDF ran somewhere other than the event-loop thread that served the request.
-    assert seen["auth_thread"] != seen["loop_thread"]
+    assert "handle_thread" in seen and "auth_thread" in seen
+    # Neither the KDF nor the request handler ran on the event-loop thread.
+    assert seen["auth_thread"] != loop_thread
+    assert seen["handle_thread"] != loop_thread
 
 
 def test_waiting_for_kdf_capacity_does_not_starve_sync_requests(config_path, monkeypatch) -> None:
@@ -557,3 +564,82 @@ def test_missing_summary_becomes_empty(tmp_path) -> None:
     path.write_bytes(build_wheel("demo", "1.0.0", summary=None))
 
     assert inspect_wheel(path, "demo-1.0.0-py3-none-any.whl").summary == ""
+
+
+def test_non_ascii_summary_is_decoded(tmp_path) -> None:
+    """Serialized core metadata is UTF-8, so a non-ASCII summary must survive."""
+    summary = "Caf\u00e9 utilities \u2014 na\u00efve fa\u00e7ade"
+
+    wheel_path = tmp_path / "demo-1.0.0-py3-none-any.whl"
+    wheel_path.write_bytes(build_wheel("demo", "1.0.0", summary=summary))
+    assert inspect_wheel(wheel_path, wheel_path.name).summary == summary
+
+    sdist_path = tmp_path / "demo-1.0.0.tar.gz"
+    sdist_path.write_bytes(build_sdist("demo", "1.0.0", summary=summary))
+    assert inspect_sdist(sdist_path, sdist_path.name).summary == summary
+
+
+def test_non_ascii_summary_publishes_and_is_searchable(instance) -> None:
+    summary = "Caf\u00e9 utilities"
+    publish(instance, "demo", summary=summary)
+
+    found = hits(pypi_search(instance, "caf\u00e9"))
+    assert [(hit["name"], hit["summary"]) for hit in found] == [("demo", summary)]
+
+
+# --------------------------------------------------------------------------- #
+# query budget
+# --------------------------------------------------------------------------- #
+
+
+def test_reproduced_term_flood_faults_instead_of_erroring(instance) -> None:
+    """1,001 terms fitted the byte cap but overflowed SQLite's expression depth."""
+    terms = [f"x{index}" for index in range(1001)]
+    body = xmlrpc.client.dumps(({"name": terms, "summary": []}, "or"), methodname="search", allow_none=False)
+    assert len(body) < rpc.MAX_REQUEST_BYTES, "the reproduction must stay inside the body cap"
+
+    response = instance.client.post("/pypi", content=body, headers={"Content-Type": XML_MEDIA})
+    assert response.status_code == 200
+    assert fault(response).faultCode == rpc.INVALID_PARAMS
+
+
+def test_a_query_at_the_term_budget_still_runs(instance) -> None:
+    publish(instance, "demo")
+
+    terms = [f"demo{index}" for index in range(rpc.MAX_TERMS - 1)] + ["demo"]
+    assert [hit["name"] for hit in hits(call(instance.client, [{"name": terms, "summary": []}, "or"]))] == ["demo"]
+
+
+def test_repeated_terms_are_deduplicated_rather_than_refused(instance) -> None:
+    """Only distinct terms cost SQL; a long list of one repeated word is fine."""
+    publish(instance, "demo")
+
+    repeated = ["demo"] * 500
+    body = xmlrpc.client.dumps(({"name": repeated, "summary": repeated}, "or"), methodname="search", allow_none=False)
+    assert len(body) < rpc.MAX_REQUEST_BYTES
+
+    response = instance.client.post("/pypi", content=body, headers={"Content-Type": XML_MEDIA})
+    assert response.status_code == 200
+    assert [hit["name"] for hit in hits(response)] == ["demo"]
+
+
+def test_name_and_summary_terms_share_one_budget(instance) -> None:
+    half = rpc.MAX_TERMS // 2 + 1
+    params = [{"name": [f"n{index}" for index in range(half)], "summary": [f"s{index}" for index in range(half)]}, "or"]
+
+    response = call(instance.client, params)
+    assert response.status_code == 200
+    assert fault(response).faultCode == rpc.INVALID_PARAMS
+
+
+def test_an_oversized_term_faults(instance) -> None:
+    response = call(instance.client, [{"name": ["x" * (rpc.MAX_TERM_LENGTH + 1)], "summary": []}, "or"])
+    assert response.status_code == 200
+    assert fault(response).faultCode == rpc.INVALID_PARAMS
+
+
+def test_parse_search_deduplicates_each_criteria_list() -> None:
+    request = rpc.parse_search([{"name": ["Demo", "demo", "DEMO"], "summary": ["Alpha", "alpha"]}, "or"])
+
+    assert request.name_terms == ("Demo",)
+    assert request.summary_terms == ("Alpha",)

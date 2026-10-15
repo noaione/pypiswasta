@@ -38,6 +38,14 @@ INVALID_PARAMS = -32602
 
 SUPPORTED_METHODS = ("search",)
 
+#: Bounds on the query itself. The body cap limits bytes, not terms, and every
+#: *distinct* term becomes another SQL ``OR`` clause, so an anonymous caller
+#: could otherwise push one statement past SQLite's expression-depth limit and
+#: turn a bad request into an HTTP 500. Refusing an over-budget query here keeps
+#: it a protocol error (-32602) that the client can actually read.
+MAX_TERMS = 128
+MAX_TERM_LENGTH = 256
+
 
 class XmlRpcError(Exception):
     """An error reported to the client through the XML-RPC fault channel."""
@@ -84,9 +92,29 @@ def _terms(value: Any) -> tuple[str, ...]:
         if not isinstance(item, str):
             raise XmlRpcError(INVALID_PARAMS, "search criteria values must be strings")
         text = item.strip()
-        if text:
-            terms.append(text)
+        if not text:
+            continue
+        if len(text) > MAX_TERM_LENGTH:
+            raise XmlRpcError(INVALID_PARAMS, f"search terms may not exceed {MAX_TERM_LENGTH} characters")
+        terms.append(text)
     return tuple(terms)
+
+
+def _dedupe(terms: Iterable[str], key: Callable[[str], str]) -> tuple[str, ...]:
+    """Keep the first spelling of every term, judged by ``key``, in client order.
+
+    ``key`` has to mirror how the SQL prefilter compares that field, so two
+    spellings that match exactly the same rows cost one clause rather than two.
+    """
+    seen: set[str] = set()
+    kept: list[str] = []
+    for term in terms:
+        normalized = key(term)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        kept.append(term)
+    return tuple(kept)
 
 
 def parse_search(params: list[Any]) -> SearchRequest:
@@ -103,6 +131,16 @@ def parse_search(params: list[Any]) -> SearchRequest:
     summary_terms = _terms(spec.get("summary"))
     if not name_terms and not summary_terms:
         raise XmlRpcError(INVALID_PARAMS, "search() needs at least one non-empty term")
+
+    # Every entry in these two lists becomes one SQL ``OR`` clause, so collapse
+    # the duplicates that would only spend expression depth. Names are compared
+    # through ``canonicalize_name`` and summaries in lowercase, so each list is
+    # deduplicated exactly the way its SQL clause compares values -- a repeated
+    # term is then free, and only *distinct* terms count against the budget.
+    name_terms = _dedupe(name_terms, canonicalize_name)
+    summary_terms = _dedupe(summary_terms, str.lower)
+    if len(name_terms) + len(summary_terms) > MAX_TERMS:
+        raise XmlRpcError(INVALID_PARAMS, f"at most {MAX_TERMS} distinct search terms are supported")
 
     # pip puts the same words in both keys, so collapse duplicates while keeping
     # the order the client sent.

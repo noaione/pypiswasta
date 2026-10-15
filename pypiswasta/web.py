@@ -19,6 +19,7 @@ from fastapi.responses import HTMLResponse
 from ._metadata import __name__ as PROJECT_NAME  # ruff: ignore[lowercase-imported-as-non-lowercase]
 from ._metadata import __version__
 from .config import BrandingConfig
+from .simple import path_component
 
 STYLESHEET = """
 :root {
@@ -245,9 +246,14 @@ def error_page(*, branding: BrandingConfig, status_code: int, message: str) -> H
 
 
 def project_url(name: str, *, private: bool = False) -> str:
-    """Path of a project's index page, in its own (public or private) namespace."""
+    """Path of a project's index page, in its own (public or private) namespace.
+
+    The name is percent-encoded before it is HTML-escaped, so a name that got
+    into the database before the project-name rules were enforced still cannot
+    inject a fragment or a query string into the link.
+    """
     prefix = "/private" if private else ""
-    return f"{prefix}/simple/{esc(name)}/"
+    return f"{prefix}/simple/{esc(path_component(name))}/"
 
 
 def search_form(query: str = "") -> str:
@@ -298,4 +304,12 @@ def search_page(
 {outcome}
 {scope_note}
 <p class="muted"><a href="/">Back to the index</a></p>"""
-    return page_response(branding=branding, title="Search", body=body)
+    # The results depend on the caller's credential: in particular, a reader or
+    # admin search names private projects, so no cache -- shared or private --
+    # may keep this response.
+    return page_response(
+        branding=branding,
+        title="Search",
+        body=body,
+        headers={"Cache-Control": "private, no-store"},
+    )

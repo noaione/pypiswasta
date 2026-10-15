@@ -571,7 +571,11 @@ so validation cannot drift between them: `DistributionError` (with its
 Sdist validation is stricter than wheel validation, because a tar archive is a
 filesystem image rather than a zip with a fixed layout:
 
-- the filename must parse as `name-version.tar.gz`;
+- the filename must parse as `name-version.tar.gz`, and the name it yields must
+  pass `canonicalize_name(..., validate=True)`. `parse_sdist_filename()` splits
+  and normalizes without checking the project-name character rules, so a name
+  such as `bad#name` was accepted and later inserted into index URLs unencoded;
+  the link then read as a fragment or a query string rather than a path;
 - the archive is read in **streaming** mode (`TarFile.open(mode="r|")`), since the
   upload is a stream that cannot be seeked;
 - every member name is rejected for absolute paths, backslashes, `..` segments,
@@ -596,6 +600,17 @@ An sdist's core metadata is its `PKG-INFO`, stored as the same
 `data-core-metadata` / `core-metadata` attributes. `Requires-Python` and the
 summary come from it; when a project predates PEP 643 and its `PKG-INFO` omits
 `Requires-Python`, the field stays absent rather than being guessed.
+
+Both inspectors parse core metadata through
+`distributions.parse_core_metadata()`, which uses `email.policy.default` instead
+of the package's `compat32` default. Serialized core metadata is UTF-8, and
+`compat32` represents a non-ASCII header — `Summary: Café utilities` — as an
+`email.header.Header` object rather than as text, so `.strip()` raised
+`AttributeError` and a perfectly valid package could not be published.
+`distributions.header_text()` coerces a header value to decoded text before any
+string operation runs, which additionally keeps a malformed header a controlled
+`DistributionError` instead of an unhandled crash. The sidecar still stores the
+original bytes verbatim, encoding included.
 
 Because sdists are first-class, `allow_sdist` is gone rather than merely
 re-defaulted: artifact kind is a property of each uploaded file, and clients
@@ -625,8 +640,11 @@ password is told so instead of quietly seeing fewer results.
 An empty or absent `q` is not an error: the page renders with its form and no
 results.
 
-`/search` is not part of the Simple API and sets `Cache-Control: no-store`, since
-its content depends on the caller's credential.
+`/search` is not part of the Simple API and sets
+`Cache-Control: private, no-store`, since its content depends on the caller's
+credential: a reader or admin search names private projects, so a shared cache
+must not keep the response and a private one is forbidden outright rather than
+merely trusted to revalidate.
 
 ### 15.11 Upload tokens
 
@@ -704,6 +722,20 @@ Protocol details:
   the same words under both `name` and `summary`, the terms are collapsed with
   `dict.fromkeys()` before the operator is applied, so `and` does not silently
   demand two matches for one word.
+- The query is bounded independently of the body: at most `rpc.MAX_TERMS` (128)
+  **distinct** terms across both criteria keys and at most `rpc.MAX_TERM_LENGTH`
+  (256) characters per term, or the call is a `-32602` fault. Each distinct term
+  becomes another SQL `OR` clause, and 1,001 terms fitted inside the 64 KiB body
+  cap while overflowing SQLite's expression-depth limit — an exception that
+  escaped the fault handling as an HTTP 500. Both criteria lists are deduplicated
+  the way their own SQL comparison treats them (`canonicalize_name()` for names,
+  lowercase for summaries), so a repeated term costs nothing and only distinct
+  terms count against the budget.
+- The whole `rpc.handle_request()` call runs in a worker thread
+  (`anyio.to_thread.run_sync`). This is the one **async** route in the
+  application, so without that its XML parsing and its SQLite query would block
+  the event loop serving every other request; the synchronous routes already get
+  a thread pool from FastAPI itself.
 - Results are `{"name", "version", "summary"}` with all three keys always present,
   because the client indexes them directly, and a version published as both a wheel
   and an sdist is emitted once.

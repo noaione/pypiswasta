@@ -20,7 +20,9 @@ from conftest import (
     build_wheel,
     parse_credentials,
     sdist_filename,
+    sdist_pkg_info_bytes,
     wheel_filename,
+    wheel_metadata_bytes,
 )
 from pypiswasta.app import (
     UPLOAD_MAX_FIELD_BYTES,
@@ -405,8 +407,8 @@ def test_accepts_large_description_within_metadata_budget(tmp_path, near_file_li
             auth=auth,
         )
         assert response.status_code == 200, response.text
-        row = client.app.state.database.get_package("demo")
-        assert client.app.state.database.list_artifacts(row["id"])[0]["size"] == len(wheel)
+        row = client.app.state.database.get_package("demo")  # type: ignore
+        assert client.app.state.database.list_artifacts(row["id"])[0]["size"] == len(wheel)  # type: ignore
 
 
 def test_oversized_extra_part_does_not_bypass_the_upload_limit(tmp_path) -> None:
@@ -430,7 +432,7 @@ def test_oversized_extra_part_does_not_bypass_the_upload_limit(tmp_path) -> None
         )
         assert response.status_code in (400, 413)
         # The wheel the caller expected to publish was not stored either.
-        assert client.app.state.database.list_installable_projects(visibility="private") == []
+        assert client.app.state.database.list_installable_projects(visibility="private") == []  # type: ignore
 
 
 def test_rejects_an_oversized_upload(tmp_path) -> None:
@@ -504,7 +506,7 @@ def test_streamed_part_budgets_stop_early_and_close_files(tmp_path, monkeypatch,
         auth = _upload_credentials(client)
 
     temporary_files = []
-    original_tempfile = formparsers.SpooledTemporaryFile
+    original_tempfile = formparsers.SpooledTemporaryFile  # type: ignore
 
     def tracked_tempfile(*args, **kwargs):
         handle = original_tempfile(*args, **kwargs)
@@ -599,3 +601,39 @@ def test_body_cap_applies_without_a_content_length(tmp_path) -> None:
             auth=auth,
         )
     assert response.status_code == 413
+
+
+def test_non_ascii_summary_publishes_with_its_original_metadata(instance) -> None:
+    """Core metadata is UTF-8, and the sidecar keeps the exact bytes sent."""
+    summary = "Caf\u00e9 utilities"
+    cases = (
+        (wheel_filename("demo", "1.0.0"), build_wheel("demo", "1.0.0", summary=summary), wheel_metadata_bytes),
+        (sdist_filename("demo", "1.0.0"), build_sdist("demo", "1.0.0", summary=summary), sdist_pkg_info_bytes),
+    )
+    for filename, blob, source_metadata in cases:
+        response = instance.upload(blob, filename)
+        assert response.status_code == 200, (filename, response.text)
+
+        sidecar = instance.client.get(
+            f"/private/files/{response.json()['sha256']}/{filename}.metadata",
+            auth=instance.auth("reader"),
+        )
+        assert sidecar.status_code == 200, filename
+        assert sidecar.content == source_metadata(blob)
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "bad#name-1.0.0.tar.gz",
+        "bad?name-1.0.0.tar.gz",
+        "bad%20name-1.0.0.tar.gz",
+    ],
+)
+def test_rejects_sdist_names_with_reserved_url_characters(instance, filename: str) -> None:
+    """A name that cannot be a URL path component must never be published."""
+    sdist = build_sdist(filename[: -len("-1.0.0.tar.gz")], "1.0.0")
+
+    response = instance.upload(sdist, filename)
+    assert response.status_code == 400, response.text
+    assert instance.client.app.state.database.list_installable_projects() == []

@@ -13,6 +13,8 @@ module having to know about the other.
 
 from __future__ import annotations
 
+import email
+import email.policy
 import hashlib
 import os
 from dataclasses import dataclass
@@ -66,6 +68,35 @@ def distribution_kind(filename: str) -> str | None:
     return None
 
 
+#: Core metadata is UTF-8 text. The email package's default ``compat32`` policy
+#: represents a non-ASCII header as an ``email.header.Header`` object rather than
+#: as text, so a valid ``Summary: Café utilities`` reached callers as something
+#: without ``.strip()`` and publishing failed with an ``AttributeError``. The
+#: modern policy decodes header values instead.
+CORE_METADATA_POLICY = email.policy.default.clone(utf8=True)
+
+
+def parse_core_metadata(data: bytes) -> Message:
+    """Parse core metadata bytes (``METADATA`` or ``PKG-INFO``) as UTF-8 headers."""
+    return email.message_from_bytes(data, policy=CORE_METADATA_POLICY)
+
+
+def header_text(message: Message, name: str) -> str:
+    """The decoded text of one header, or ``""`` when it is absent.
+
+    A policy that cannot decode a value can still hand back a header object, so
+    the value is coerced to text before any string operation runs: calling
+    ``.strip()`` on an ``email.header.Header`` is an ``AttributeError``, which is
+    a crash rather than the controlled validation error a bad upload deserves.
+    """
+    value = message.get(name)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        value = str(value)
+    return value.strip()
+
+
 def parse_optional_core_metadata(message: Message) -> tuple[str | None, str]:
     """Read the two core-metadata fields this index keeps from an upload.
 
@@ -74,10 +105,7 @@ def parse_optional_core_metadata(message: Message) -> tuple[str | None, str]:
     ``Requires-Python`` feeds the index filter, ``Summary`` feeds the legacy
     search that ``pip search`` uses.
     """
-    requires_python = message.get("Requires-Python")
-    if requires_python is not None:
-        requires_python = requires_python.strip() or None
-    return requires_python, (message.get("Summary") or "").strip()
+    return header_text(message, "Requires-Python") or None, header_text(message, "Summary")
 
 
 def reject_unsafe_filename(filename: str, error: type[DistributionError]) -> None:

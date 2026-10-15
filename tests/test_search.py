@@ -161,3 +161,31 @@ def test_search_counts_sdists(instance) -> None:
 
     page = instance.client.get("/search", params={"q": "demo"}).text
     assert "1 match(es)" in page
+
+
+# --------------------------------------------------------------------------- #
+# cache protections
+# --------------------------------------------------------------------------- #
+
+
+def test_search_response_is_never_cacheable(instance) -> None:
+    """Whoever asked decides the results, so no cache may keep the response."""
+    publish(instance, "secret", public=False)
+
+    responses = {
+        "anonymous": instance.client.get("/search", params={"q": "secret"}),
+        "reader": instance.client.get("/search", params={"q": "secret"}, auth=instance.auth("reader")),
+        "no query": instance.client.get("/search"),
+        "no matches": instance.client.get("/search", params={"q": "absent"}),
+    }
+    for label, response in responses.items():
+        assert response.status_code == 200, label
+        assert response.headers["cache-control"] == "private, no-store", label
+
+
+def test_reader_search_marks_private_names_uncacheable(instance) -> None:
+    publish(instance, "secret", public=False)
+
+    response = instance.client.get("/search", params={"q": "secret"}, auth=instance.auth("reader"))
+    assert "secret" in response.text
+    assert response.headers["cache-control"] == "private, no-store"
