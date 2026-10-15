@@ -323,8 +323,10 @@ def _install_routes(app: FastAPI) -> None:
     async def xmlrpc_search(request: Request) -> Response:
         _, database, _, _ = _state(request)
         # Anonymous callers see public projects; reader credentials (or better)
-        # also see private ones, matching /search.
-        credential = optional_reader(request)
+        # also see private ones, matching /search. Authentication can involve a
+        # slow KDF (an Argon2 administrator password), so it runs in a worker
+        # thread instead of stalling every request this loop handles.
+        credential = await anyio.to_thread.run_sync(optional_reader, request)
 
         # Read with a hard cap instead of trusting Content-Length, so an
         # oversized body is never buffered into memory.

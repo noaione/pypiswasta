@@ -754,5 +754,42 @@ upload re-installs a fresh object.
   statement failing with "duplicate column name" is skipped, so re-running the
   script finishes the remaining steps and stamps the version.
 - Retries the one-time switch to WAL, because several workers starting together
-  on a fresh database otherwise race and fail with "database is locked".
+  on a fresh database otherwise race and fail with "database is locked". The
+  retry loop is bounded by an elapsed-time budget (about a second) and caps
+  SQLite's own busy wait at whatever remains of it, so a held reader cannot
+  multiply the configured busy timeout across attempts; only lock/busy errors are
+  retried, and the configured timeout is restored before the migration
+  transaction, which relies on it.
+
+### 15.15 Authentication work is bounded and kept off the event loop (§4/§15.12)
+
+`POST /pypi` authenticates from an async handler, so that work runs on the event
+loop unless it is moved off. Four bounds now apply:
+
+- **No gratuitous slow KDF.** The dummy Argon2 verification that equalises
+  timing for an unknown username runs only when the snapshot actually contains
+  an Argon2 credential. A store of fast SHA-256 digests -- the default, since
+  setup and token secrets are machine generated -- has no timing to equalise,
+  and burning tens of MiB per unknown username was a trivial anonymous
+  denial-of-service amplifier.
+- **Off the loop.** `xmlrpc_search` runs `optional_reader` through
+  `anyio.to_thread.run_sync`, so an Argon2 verification (or the dummy burn in an
+  Argon2 deployment) cannot stall unrelated requests handled by that worker.
+- **Bounded concurrency, taken without blocking.** `verify_argon2` takes one of
+  a small fixed number of slots *without waiting*; if they are all busy the
+  verification simply fails, exactly like a wrong password. Bounding simultaneous
+  KDF calls bounds their memory, and never blocking means a worker thread is
+  never pinned while waiting for capacity -- which would starve unrelated
+  endpoints, including synchronous ones such as `/healthz`.
+- **Prepared dummy hash.** Installing a credential snapshot containing Argon2
+  credentials computes its dummy hash through the bounded hashing helper before
+  publishing that snapshot. Fast-only snapshots skip this work. Authentication
+  only verifies the prepared value, so the first request burst cannot race on a
+  lazy cache miss and launch unbounded hashes. Preparation failures leave the
+  previous credential snapshot intact.
+
+Attempt rate limiting was deliberately not added: it needs a trusted
+client-identity design that the deployed reverse proxy has not been reviewed
+for, and the four bounds above already cap the amplification the review
+measured.
 

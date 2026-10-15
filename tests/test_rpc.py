@@ -8,13 +8,19 @@ format rather than a hand-written approximation of it.
 
 from __future__ import annotations
 
+import threading
 import xmlrpc.client
 from typing import Any
 
+import anyio
+import httpx
 import pytest
 
 from conftest import Instance, build_sdist, build_wheel, sdist_filename, wheel_filename
-from pypiswasta import rpc
+from pypiswasta import auth as auth_module
+from pypiswasta import db, rpc
+from pypiswasta.app import create_app
+from pypiswasta.config import load_config
 from pypiswasta.sdists import inspect_sdist
 from pypiswasta.wheels import inspect_wheel
 
@@ -267,6 +273,206 @@ def test_upload_role_cannot_use_the_reader_view(instance) -> None:
 
 def test_wrong_credentials_are_rejected(instance) -> None:
     assert pypi_search(instance, "demo", auth=("reader", "wrong")).status_code == 401
+
+
+def test_authentication_is_offloaded_from_the_event_loop(instance, monkeypatch) -> None:
+    """A slow KDF must run in a worker thread, not on the loop serving requests."""
+    # Force the slow-KDF path: an Argon2 administrator credential in the store.
+    instance.client.app.state.auth.install([
+        {
+            "role": "admin",
+            "username": "root",
+            "algorithm": db.ALGORITHM_ARGON2ID,
+            "password_hash": "$argon2id$fake",
+        }
+    ])
+
+    seen: dict[str, int] = {}
+    real_handle_request = rpc.handle_request
+
+    def spy_handle_request(document, run):
+        seen["loop_thread"] = threading.get_ident()
+        return real_handle_request(document, run)
+
+    def spy_verify_argon2(stored, password):
+        seen["auth_thread"] = threading.get_ident()
+        return True
+
+    monkeypatch.setattr(rpc, "handle_request", spy_handle_request)
+    monkeypatch.setattr(auth_module, "verify_argon2", spy_verify_argon2)
+
+    response = pypi_search(instance, "demo", auth=("root", "whatever"))
+
+    assert response.status_code == 200
+    assert "loop_thread" in seen and "auth_thread" in seen
+    # The KDF ran somewhere other than the event-loop thread that served the request.
+    assert seen["auth_thread"] != seen["loop_thread"]
+
+
+def test_waiting_for_kdf_capacity_does_not_starve_sync_requests(config_path, monkeypatch) -> None:
+    """A request kept waiting for KDF capacity must not hold a worker thread.
+
+    The worker pool is reduced to a single thread and the KDF capacity permit is
+    replaced by one that never grants capacity. ``/healthz`` is a synchronous
+    endpoint served from that same pool, so it can be answered only if the
+    waiting request is *not* occupying the thread while it waits.
+    """
+    app = create_app(config_path)
+    # Route an unknown username down the slow-KDF path.
+    app.state.auth.install([
+        {
+            "role": "admin",
+            "username": "root",
+            "algorithm": db.ALGORITHM_ARGON2ID,
+            "password_hash": "$argon2id$fake",
+        }
+    ])
+    release = threading.Event()
+    state: dict[str, Any] = {"reached": None}
+
+    class _HeldPermit:
+        """A capacity permit that is permanently unavailable."""
+
+        def acquire(self, blocking: bool = True) -> bool:
+            reached = state["reached"]
+            if reached is not None:
+                # Runs on the event loop, not on this worker thread.
+                anyio.from_thread.run_sync(reached.set)
+            if blocking:
+                release.wait(30)
+            return False
+
+        def release(self) -> None:  # pragma: no cover - never granted
+            pass
+
+        def __enter__(self) -> bool:
+            return self.acquire(blocking=True)
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    monkeypatch.setattr(auth_module, "_argon2_slots", _HeldPermit())
+
+    async def scenario() -> int:
+        anyio.to_thread.current_default_thread_limiter().total_tokens = 1
+        reached = anyio.Event()
+        state["reached"] = reached
+
+        response: httpx.Response | None = None
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+
+            async def attempt() -> None:
+                await client.post(
+                    "/pypi",
+                    content=b"<methodCall/>",
+                    headers={"Content-Type": "text/xml"},
+                    auth=("ghost", "whatever"),
+                )
+
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(attempt)
+                # Wait until the request is asking for KDF capacity.
+                with anyio.fail_after(5):
+                    await reached.wait()
+                try:
+                    # An unrelated synchronous endpoint must still be served.
+                    with anyio.fail_after(2):
+                        response = await client.get("/healthz")
+                finally:
+                    # Unblock the waiting worker before the task group exits, so a
+                    # failure surfaces promptly instead of waiting out its guard.
+                    release.set()
+
+        assert response is not None
+        return response.status_code
+
+    assert anyio.run(scenario) == 200
+
+
+def test_cold_argon2_startup_bounds_first_request_burst(config_path, monkeypatch) -> None:
+    """The first unknown-user burst never performs unbounded dummy hashing."""
+    config = load_config(config_path)
+    database = db.Database(config.storage.database)
+    database.migrate()
+    try:
+        with database.write() as conn:
+            database.upsert_credential(
+                conn,
+                role="admin",
+                username="root",
+                algorithm=db.ALGORITHM_ARGON2ID,
+                password_hash="stored-admin-hash",  # ruff: ignore[hardcoded-password-func-arg]
+            )
+    finally:
+        database.close()
+
+    bound = auth_module._ARGON2_MAX_CONCURRENCY
+    release = threading.Event()
+    lock = threading.Lock()
+    state: dict[str, Any] = {"hashes": 0, "active": 0, "peak": 0, "entered": None}
+
+    class _Hasher:
+        def hash(self, password: str) -> str:
+            state["hashes"] += 1
+            return "prepared-dummy-hash"
+
+        def verify(self, stored: str, password: str) -> bool:
+            with lock:
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+                full = state["active"] == bound
+            try:
+                assert stored == "prepared-dummy-hash"
+                if full:
+                    anyio.from_thread.run_sync(state["entered"].set)
+                assert release.wait(timeout=5), "test did not release the held verifications"
+                return False
+            finally:
+                with lock:
+                    state["active"] -= 1
+
+    monkeypatch.setattr(auth_module, "_hasher", _Hasher())
+    monkeypatch.setattr(auth_module, "_argon2_slots", threading.BoundedSemaphore(bound))
+    app = create_app(config_path)
+    # No manual cache warm-up: the application must do this before accepting
+    # its very first request, including on a fresh process/store.
+    assert state["hashes"] == 1
+
+    async def scenario() -> None:
+        entered = anyio.Event()
+        refused = anyio.Event()
+        state["entered"] = entered
+        attempts = 40
+        responses: list[int] = []
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+
+            async def attempt() -> None:
+                response = await client.post("/pypi", content=b"", auth=("ghost", "wrong"))
+                responses.append(response.status_code)
+                if len(responses) == attempts - bound:
+                    refused.set()
+
+            async with anyio.create_task_group() as task_group:
+                for _ in range(attempts):
+                    task_group.start_soon(attempt)
+                try:
+                    with anyio.fail_after(3):
+                        await entered.wait()
+                        await refused.wait()
+                        # All KDF slots stay held while a synchronous endpoint
+                        # uses the same worker pool as the authentication burst.
+                        response = await client.get("/healthz")
+                    assert response.status_code == 200
+                    assert state["hashes"] == 1
+                finally:
+                    release.set()
+        assert responses == [401] * attempts
+
+    anyio.run(scenario)
+    assert state["peak"] == bound
+    assert state["active"] == 0
+    assert state["hashes"] == 1
 
 
 # --------------------------------------------------------------------------- #

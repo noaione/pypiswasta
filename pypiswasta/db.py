@@ -135,30 +135,52 @@ def _apply_statement(conn: sqlite3.Connection, statement: str) -> None:
         raise
 
 
-#: Bounded retry budget for the one-time switch to WAL while concurrent workers
-#: race to convert the same fresh database.
-_WAL_RETRY_ATTEMPTS = 50
+#: Total time budget for the one-time switch to WAL. The journal mode is a
+#: persistent property of the file, so if the switch cannot be made within this
+#: window the migration carries on in the existing mode rather than stalling.
+_WAL_INIT_BUDGET_SECONDS = 1.0
+#: Pause between conversion attempts, once an attempt has returned.
 _WAL_RETRY_DELAY_SECONDS = 0.005
 
 
-def _enable_wal(conn: sqlite3.Connection) -> None:
-    """Switch the database to WAL, tolerating a concurrent conversion.
+def _is_busy_error(exc: sqlite3.Error) -> bool:
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
 
-    Every worker reaches this at once on a fresh database. Changing the journal
-    mode needs a brief exclusive lock, and SQLite reports "database is locked"
-    instead of waiting when another connection is performing the same
-    conversion. WAL is a persistent property of the file, so retry briefly; the
-    database stays usable in either mode, so give up gracefully rather than
-    failing startup.
+
+def _enable_wal(conn: sqlite3.Connection, *, busy_timeout_ms: int) -> None:
+    """Switch the database to WAL within a bounded time budget.
+
+    Every worker reaches this at once on a fresh database, and changing the
+    journal mode needs a brief exclusive lock that SQLite reports as
+    "database is locked". Waiting for that lock honours the connection's busy
+    timeout, so each attempt caps the timeout at whatever remains of the budget
+    instead of letting every retry wait the full configured duration. Only
+    lock/busy errors are retried; anything else is a genuine fault and
+    propagates. The configured busy timeout is restored before the caller's
+    migration transaction, which relies on it.
     """
-    for _ in range(_WAL_RETRY_ATTEMPTS):
-        try:
-            row = conn.execute("PRAGMA journal_mode = WAL").fetchone()
-        except sqlite3.OperationalError:
-            time.sleep(_WAL_RETRY_DELAY_SECONDS)
-            continue
-        if row is not None and str(row[0]).lower() == "wal":
-            return
+    deadline = time.monotonic() + _WAL_INIT_BUDGET_SECONDS
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            conn.execute(f"PRAGMA busy_timeout = {max(1, int(remaining * 1000))}")
+            try:
+                row = conn.execute("PRAGMA journal_mode = WAL").fetchone()
+            except sqlite3.OperationalError as exc:
+                if not _is_busy_error(exc):
+                    raise
+            else:
+                if row is not None and str(row[0]).lower() == "wal":
+                    return
+            delay = deadline - time.monotonic()
+            if delay <= 0:
+                return
+            time.sleep(min(_WAL_RETRY_DELAY_SECONDS, delay))
+    finally:
+        conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
 
 
 def _like_pattern(query: str) -> str:
@@ -214,7 +236,7 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = self._connect()
         try:
-            _enable_wal(conn)
+            _enable_wal(conn, busy_timeout_ms=self.busy_timeout_ms)
             conn.execute("PRAGMA synchronous = NORMAL")
             # Serialize concurrent migrators and make each step atomic.
             # BEGIN IMMEDIATE takes the write lock *before* the version is read,

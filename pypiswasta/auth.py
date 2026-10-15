@@ -17,11 +17,11 @@ from __future__ import annotations
 
 import base64
 import binascii
-import functools
 import hashlib
 import hmac
 import re
 import secrets
+import threading
 from dataclasses import dataclass
 from typing import Any, Iterable, Protocol, SupportsIndex, overload
 
@@ -116,27 +116,34 @@ def verify_fast_digest(role: str, stored: str, password: str) -> bool:
     return hmac.compare_digest(stored, fast_password_digest(role, password))
 
 
+#: Bound on simultaneous Argon2 work. Each call allocates tens of MiB, so a
+#: burst must not be able to hold many at once. Capacity is taken *without
+#: blocking*: a worker thread must never wait here, because holding a shared
+#: worker slot while queued would starve unrelated (including synchronous)
+#: endpoints. Excess work is refused promptly instead -- a failed verification,
+#: exactly like a wrong password.
+_ARGON2_MAX_CONCURRENCY = 4
+_argon2_slots = threading.BoundedSemaphore(_ARGON2_MAX_CONCURRENCY)
+
+
 def hash_argon2(password: str) -> str:
-    return _hasher.hash(password)
+    # Credential creation is not attacker-reachable at scale, so blocking here is
+    # fine: a human running ``auth set-admin-password`` has nothing to race.
+    with _argon2_slots:
+        return _hasher.hash(password)
 
 
 def verify_argon2(stored: str, password: str) -> bool:
+    if not _argon2_slots.acquire(blocking=False):
+        return False
     try:
         return _hasher.verify(stored, password)
     except (VerifyMismatchError, VerificationError, InvalidHashError):
         return False
     except Exception:  # pragma: no cover - defensive
         return False
-
-
-@functools.lru_cache(maxsize=1)
-def _dummy_argon2_hash() -> str:
-    """A real Argon2id hash used to equalise work for unknown usernames."""
-    return _hasher.hash("pypiswasta-dummy-password")
-
-
-def _burn_unknown_user_time(password: str) -> None:
-    verify_argon2(_dummy_argon2_hash(), password)
+    finally:
+        _argon2_slots.release()
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +212,7 @@ class AuthStore:
         self._by_role: dict[str, Credential] = {}
         self._tokens: tuple[Credential, ...] = ()
         self._initialized = False
+        self._dummy_hash: str | None = None
 
     def install(self, rows: Iterable[_RowLike], tokens: Iterable[_RowLike] = ()) -> None:
         by_username: dict[str, Credential] = {}
@@ -237,10 +245,17 @@ class AuthStore:
             by_username[credential.username] = credential
             token_credentials.append(credential)
 
-        # Atomic swap: a single attribute rebind is observed by other threads.
+        # Prepare the dummy hash before publishing an Argon2 snapshot. Request
+        # authentication must never hash on a cache miss or wait for this work.
+        # If preparation fails, the previous snapshot stays intact.
+        uses_argon2 = any(cred.algorithm == db_module.ALGORITHM_ARGON2ID for cred in by_username.values())
+        dummy_hash = hash_argon2("pypiswasta-dummy-password") if uses_argon2 else None
+
+        # Replace each prepared collection intact rather than mutating it.
         self._by_username = by_username
         self._by_role = by_role
         self._tokens = tuple(token_credentials)
+        self._dummy_hash = dummy_hash
         self._initialized = "admin" in by_role
 
     def reload(self, database: db_module.Database) -> None:
@@ -267,7 +282,13 @@ class AuthStore:
             # which token this is.
             if username == TOKEN_SENTINEL:
                 return self._match_token(password)
-            _burn_unknown_user_time(password)
+            # Only pay for a timing-equalising Argon2 burn when a slow KDF is
+            # actually in use. A store of fast SHA-256 digests has nothing to
+            # hide, and burning tens of MiB per unknown username would hand an
+            # anonymous caller a trivial denial-of-service amplifier.
+            dummy_hash = self._dummy_hash
+            if dummy_hash is not None:
+                verify_argon2(dummy_hash, password)
             return None
         if verify_credential(credential, password):
             return credential

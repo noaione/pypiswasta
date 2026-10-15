@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
 from pypiswasta import db as db_module
-from pypiswasta.db import _SCHEMA_V1, _SCHEMA_V2, SCHEMA_VERSION, Database, _iter_statements
+from pypiswasta.db import _SCHEMA_V1, _SCHEMA_V2, SCHEMA_VERSION, Database, _enable_wal, _iter_statements
 
 WHEEL = "demo-1.0.0-py3-none-any.whl"
 
@@ -209,4 +210,47 @@ def test_failed_migration_rolls_back_completely(tmp_path: Path, monkeypatch) -> 
     assert database.schema_version == SCHEMA_VERSION
     tables = {row[0] for row in database.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert "partial" not in tables
+    database.close()
+
+
+def test_wal_switch_wait_is_bounded_when_a_reader_holds_the_database(tmp_path: Path, monkeypatch) -> None:
+    """A held reader must not multiply the busy timeout across every retry."""
+    monkeypatch.setattr(db_module, "_WAL_INIT_BUDGET_SECONDS", 0.3)
+
+    path = tmp_path / "held.db"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE t (a)")
+    connection.commit()
+    connection.close()
+
+    reader = sqlite3.connect(path, isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT * FROM t").fetchall()
+    try:
+        database = Database(path, busy_timeout_ms=100)
+        conn = database._connect()
+        try:
+            start = time.monotonic()
+            _enable_wal(conn, busy_timeout_ms=database.busy_timeout_ms)
+            elapsed = time.monotonic() - start
+            # The configured timeout is restored for the migration transaction.
+            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == database.busy_timeout_ms
+        finally:
+            conn.close()
+        # Fifty retries of a 100 ms SQLite wait would be over five seconds.
+        assert elapsed < 1.5
+    finally:
+        reader.execute("ROLLBACK")
+        reader.close()
+
+    assert sqlite3.connect(path).execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+
+    # Once the reader releases its lock, the switch succeeds.
+    database.migrate()
+    assert database.schema_version == SCHEMA_VERSION
+    probe = sqlite3.connect(path)
+    try:
+        assert probe.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        probe.close()
     database.close()
