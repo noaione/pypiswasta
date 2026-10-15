@@ -1,6 +1,6 @@
 [project]
 name = "pypiswasta"
-version = "0.1.0"
+version = "0.1.1"
 description = "Private PyPI server with some additional bell-and-whistle"
 license = "MPL-2.0"
 readme = "README.md"
