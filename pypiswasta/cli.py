@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
 
 from . import __version__
 from .auth import (
@@ -346,6 +347,33 @@ def _cmd_package_visibility(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_package_yank(args: argparse.Namespace) -> int:
+    """Set or clear a release's yank without changing its artifact files."""
+    try:
+        version = str(Version(args.version))
+    except InvalidVersion:
+        print(f"error: invalid version: {args.version!r}", file=sys.stderr)
+        return 1
+
+    config = load_config(args.config)
+    database = _open_db(config)
+    name = canonicalize_name(args.name)
+    try:
+        with database.write() as conn:
+            package = database.get_package(name)
+            if package is None:
+                print(f"error: unknown project: {name}", file=sys.stderr)
+                return 1
+            if not database.set_release_yanked(conn, package["id"], version, reason=args.reason):
+                print(f"error: unknown version: {name} {version}", file=sys.stderr)
+                return 1
+        action = "unyanked" if args.reason is None else "yanked"
+        print(f"{action} {name} {version}")
+        return 0
+    finally:
+        database.close()
+
+
 def _cmd_package_delete(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     database = _open_db(config)
@@ -537,6 +565,17 @@ def _build_parser() -> argparse.ArgumentParser:
     package_visibility.add_argument("name")
     package_visibility.add_argument("visibility", choices=["public", "private"])
     package_visibility.set_defaults(handler=_cmd_package_visibility)
+
+    package_yank = package_sub.add_parser("yank", parents=[common], help="mark a release as yanked for installers")
+    package_yank.add_argument("name")
+    package_yank.add_argument("version")
+    package_yank.add_argument("--reason", default="", help="optional reason displayed to installers")
+    package_yank.set_defaults(handler=_cmd_package_yank)
+
+    package_unyank = package_sub.add_parser("unyank", parents=[common], help="make a yanked release selectable again")
+    package_unyank.add_argument("name")
+    package_unyank.add_argument("version")
+    package_unyank.set_defaults(handler=_cmd_package_yank, reason=None)
 
     package_delete = package_sub.add_parser("delete", parents=[common], help="delete a project record")
     package_delete.add_argument("name")

@@ -206,6 +206,7 @@ def _file_entries(artifacts, *, prefix: str) -> list[simple.FileEntry]:
             requires_python=row["requires_python"],
             size=row["size"],
             version=row["version"],
+            yanked_reason=row["yanked_reason"],
         )
         for row in artifacts
     ]

@@ -113,6 +113,18 @@ FastAPI's test client; do not depend on a production configuration or data store
   Reusing a filename with identical bytes is idempotent; different bytes replace
   its reference only when `allow_overwrite` permits it. New projects default to
   private; project visibility applies to all versions.
+- Yanking is CLI-only and applies to a project version across all its files.
+  Schema v4 stores sparse `yanked_releases` rows with canonical PEP 440 version
+  keys; `canonical_version()` is registered on every SQLite connection for
+  matching stored artifact versions. Preserve yanks across later uploads,
+  replacements and deletion of all files. Explicit unyanking clears the row;
+  deleting the project cascades to its yanks. Change state under the writer lock.
+  `FileEntry.yanked_reason` is `None` for active files and a string (including an
+  empty string) for yanked ones. Emit escaped HTML `data-yanked` and JSON `yanked`
+  as a nonempty reason or `true`; never serialize a reasonless yank as `""` in
+  JSON. Keep files and sidecars downloadable under the existing visibility rules.
+  The HTML page uses CSS `a[data-yanked]::before` for the visible `(YANKED)`
+  marker; preserve the actual anchor text as the exact distribution filename.
 - GC must recheck live references and delete candidates while holding the same
   SQLite writer lock used by publishing. Blob age alone is insufficient:
   re-publishing identical bytes can make an old orphan live again.
@@ -160,7 +172,8 @@ The main routes are public `/simple/` and `/files/...`, authenticated
 ## Tests and documentation
 
 Use the relevant test modules for changes: `test_setup.py` and `test_auth.py` for
-setup/authentication; `test_tokens.py` for token lifecycle; `test_upload.py`,
+setup/authentication; `test_tokens.py` for token lifecycle; `test_yanking.py` for
+CLI yanks, index metadata, version equivalence and upload persistence; `test_upload.py`,
 `test_wheels.py` and `test_sdist.py` for publishing; `test_simple_api.py` and
 `test_admin_api.py` for visibility and downloads; `test_search.py` and
 `test_rpc.py` for search; `test_migrations.py` and the GC cases in `test_cli.py`

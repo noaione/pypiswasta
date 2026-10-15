@@ -16,9 +16,9 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
-from packaging.utils import canonicalize_name
+from packaging.utils import canonicalize_name, canonicalize_version
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 ROLES = ("admin", "upload", "reader")
 
@@ -96,7 +96,19 @@ _SCHEMA_V3 = """
 ALTER TABLE artifacts ADD COLUMN summary TEXT NOT NULL DEFAULT '';
 """
 
-MIGRATIONS: tuple[tuple[int, str], ...] = ((1, _SCHEMA_V1), (2, _SCHEMA_V2), (3, _SCHEMA_V3))
+# A sparse release-level table keeps a yank in place when artifacts are added,
+# replaced or removed. Versions use canonicalize_version's PEP 440 equality key
+# (including removal of trailing zeroes), not the original filename spelling.
+_SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS yanked_releases (
+    package_id INTEGER NOT NULL REFERENCES packages(id) ON DELETE CASCADE,
+    version    TEXT NOT NULL,
+    reason     TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (package_id, version)
+);
+"""
+
+MIGRATIONS: tuple[tuple[int, str], ...] = ((1, _SCHEMA_V1), (2, _SCHEMA_V2), (3, _SCHEMA_V3), (4, _SCHEMA_V4))
 
 
 def _iter_statements(script: str) -> Iterator[str]:
@@ -215,6 +227,7 @@ class Database:
         conn.row_factory = sqlite3.Row
         conn.isolation_level = None  # explicit transactions
         conn.create_function("unicode_casefold", 1, str.casefold, deterministic=True)
+        conn.create_function("canonical_version", 1, canonicalize_version, deterministic=True)
         conn.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
@@ -434,10 +447,47 @@ class Database:
     def list_artifacts(self, package_id: int) -> list[sqlite3.Row]:
         return list(
             self.conn.execute(
-                "SELECT * FROM artifacts WHERE package_id = ? ORDER BY version DESC, filename",
+                "SELECT a.*, y.reason AS yanked_reason FROM artifacts a "
+                "LEFT JOIN yanked_releases y "
+                "ON y.package_id = a.package_id AND y.version = canonical_version(a.version) "
+                "WHERE a.package_id = ? ORDER BY a.version DESC, a.filename",
                 (package_id,),
             ).fetchall()
         )
+
+    def set_release_yanked(
+        self,
+        conn: sqlite3.Connection,
+        package_id: int,
+        version: str,
+        *,
+        reason: str | None,
+    ) -> bool:
+        """Yank a known release, or clear its yank when ``reason`` is ``None``.
+
+        An empty reason still means yanked. Keep the row until explicitly
+        unyanked or the project is deleted, even if every artifact is removed.
+        Callers hold the writer lock so publishing cannot race the existence
+        check or the state change.
+        """
+        version = canonicalize_version(version)
+        known = conn.execute(
+            "SELECT 1 FROM artifacts WHERE package_id = ? AND canonical_version(version) = ? "
+            "UNION ALL SELECT 1 FROM yanked_releases WHERE package_id = ? AND version = ? LIMIT 1",
+            (package_id, version, package_id, version),
+        ).fetchone()
+        if known is None:
+            return False
+        if reason is None:
+            conn.execute("DELETE FROM yanked_releases WHERE package_id = ? AND version = ?", (package_id, version))
+        else:
+            conn.execute(
+                "INSERT INTO yanked_releases (package_id, version, reason) VALUES (?, ?, ?) "
+                "ON CONFLICT(package_id, version) DO UPDATE SET reason = excluded.reason",
+                (package_id, version, reason),
+            )
+        self.touch_package(conn, package_id)
+        return True
 
     def get_artifact(self, package_id: int, filename: str) -> sqlite3.Row | None:
         return self.conn.execute(

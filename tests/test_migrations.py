@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from pypiswasta import db as db_module
-from pypiswasta.db import _SCHEMA_V1, _SCHEMA_V2, SCHEMA_VERSION, Database, _enable_wal, _iter_statements
+from pypiswasta.db import _SCHEMA_V1, _SCHEMA_V2, _SCHEMA_V3, SCHEMA_VERSION, Database, _enable_wal, _iter_statements
 
 WHEEL = "demo-1.0.0-py3-none-any.whl"
 
@@ -90,6 +90,32 @@ def test_upgrades_a_v2_database_and_keeps_its_packagetype(tmp_path: Path) -> Non
     assert row["packagetype"] == "sdist"
     assert row["summary"] == ""
     database.close()
+
+
+def test_upgrades_v3_without_yanking_existing_releases(tmp_path: Path) -> None:
+    path = tmp_path / "v3.db"
+    seed(
+        path,
+        _SCHEMA_V1 + _SCHEMA_V2 + _SCHEMA_V3,
+        3,
+        "INSERT INTO artifacts (package_id, filename, version, sha256, metadata_sha256, size, summary)"
+        " VALUES (1, ?, '1.0.0', ?, ?, 123, 'Existing summary')",
+        (WHEEL, "a" * 64, "b" * 64),
+    )
+    database = Database(path)
+    try:
+        database.migrate()
+        assert database.schema_version == SCHEMA_VERSION
+        row = database.list_artifacts(1)[0]
+        assert row["summary"] == "Existing summary"
+        assert row["sha256"] == "a" * 64
+        assert row["yanked_reason"] is None
+        with database.write() as conn:
+            assert database.set_release_yanked(conn, 1, "1.0", reason="Broken release")
+        database.migrate()
+        assert database.list_artifacts(1)[0]["yanked_reason"] == "Broken release"
+    finally:
+        database.close()
 
 
 def test_migrate_is_idempotent(tmp_path: Path) -> None:

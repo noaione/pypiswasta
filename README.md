@@ -162,6 +162,28 @@ After a replacement, refresh affected lockfiles and client caches as needed
 (for example, `uv cache clean my-package`). Avoid `uv publish --check-url` when
 replacing a file: it skips filenames already present on the index.
 
+### Yank a broken release
+
+On the server, mark an entire version as yanked, with an optional reason:
+
+```sh
+pypiswasta package yank my-package 1.2.3 --reason "Broken imports" --config /etc/pypiswasta/config.toml
+pypiswasta package unyank my-package 1.2.3 --config /etc/pypiswasta/config.toml
+```
+
+Yanking and unyanking are CLI-only operations and take effect without a service
+restart. They cover every wheel and sdist for that version, including files added
+later or replaced after the yank. Equivalent versions such as `1.2` and `1.2.0`
+share the same state; local versions such as `1.2+cpu` remain separate.
+
+When browsing a project's Simple index page, yanked files display a bold
+`(YANKED)` marker before their filenames.
+
+Yanked releases stay listed and downloadable, with a marker telling installers
+to skip them during normal version selection. Exact pins such as
+`my-package==1.2.3` may still install them with a warning. Yanking does not remove
+files or change access permissions. See the [file-yanking specification](https://packaging.python.org/en/latest/specifications/file-yanking/).
+
 ### Use tokens for automation
 
 Give each publisher its own upload token so it can be revoked independently:

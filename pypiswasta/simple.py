@@ -42,6 +42,7 @@ class FileEntry:
     requires_python: str | None
     size: int
     version: str
+    yanked_reason: str | None = None
 
 
 def esc(value: object) -> str:
@@ -181,6 +182,8 @@ def render_project_html(name: str, files: list[FileEntry]) -> str:
         attributes = []
         if entry.requires_python:
             attributes.append(f'data-requires-python="{esc(entry.requires_python)}"')
+        if entry.yanked_reason is not None:
+            attributes.append(f'data-yanked="{esc(entry.yanked_reason)}"')
         attributes.append(f'data-core-metadata="sha256={esc(entry.metadata_sha256)}"')
         attribute_text = "".join(f" {attribute}" for attribute in attributes)
         rows.append(
@@ -193,6 +196,13 @@ def render_project_html(name: str, files: list[FileEntry]) -> str:
         "  <head>\n"
         f'    <meta name="pypi:repository-version" content="{API_VERSION}">\n'
         f"    <title>Links for {esc(name)}</title>\n"
+        "    <style>\n"
+        "      a[data-yanked]::before {\n"
+        '        content: "(YANKED) ";\n'
+        "        color: #b45309;\n"
+        "        font-weight: bold;\n"
+        "      }\n"
+        "    </style>\n"
         "  </head>\n"
         "  <body>\n"
         f"    <h1>Links for {esc(name)}</h1>\n"
@@ -236,6 +246,8 @@ def _file_payload(entry: FileEntry) -> dict[str, object]:
     }
     if entry.requires_python:
         payload["requires-python"] = entry.requires_python
+    if entry.yanked_reason is not None:
+        payload["yanked"] = entry.yanked_reason or True
     return payload
 
 
