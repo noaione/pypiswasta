@@ -737,3 +737,22 @@ reuses an existing content-addressed object (keeping its old modification time),
 the grace period alone would not spare it. If GC wins the race instead, the later
 upload re-installs a fresh object.
 
+### 15.14 Schema migrations are serialized, atomic and self-healing (§5)
+
+`Database.migrate()` runs at startup in every worker. It now:
+
+- **Serializes** by opening `BEGIN IMMEDIATE` *before* reading `PRAGMA
+  user_version`, so a second worker waits for the write lock and then sees the
+  version already advanced instead of replaying an `ALTER TABLE`.
+- **Applies each step atomically**: the schema changes and the `user_version`
+  stamp commit in one transaction, so an interruption cannot leave the schema
+  ahead of the recorded version. `executescript()` is deliberately **not** used
+  for this -- it commits any pending transaction before it runs, which is why an
+  outer `BEGIN` alone would not protect it. Scripts are split into statements
+  with `sqlite3.complete_statement` and executed one at a time.
+- **Recovers** a database left partially migrated by an older release: a
+  statement failing with "duplicate column name" is skipped, so re-running the
+  script finishes the remaining steps and stamps the version.
+- Retries the one-time switch to WAL, because several workers starting together
+  on a fresh database otherwise race and fail with "database is locked".
+

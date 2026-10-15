@@ -8,9 +8,13 @@ tests seed a database at each older version and check it survives.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 
-from pypiswasta.db import _SCHEMA_V1, _SCHEMA_V2, SCHEMA_VERSION, Database
+import pytest
+
+from pypiswasta import db as db_module
+from pypiswasta.db import _SCHEMA_V1, _SCHEMA_V2, SCHEMA_VERSION, Database, _iter_statements
 
 WHEEL = "demo-1.0.0-py3-none-any.whl"
 
@@ -123,4 +127,86 @@ def test_upgraded_database_accepts_a_new_artifact(tmp_path: Path) -> None:
 
     row = database.conn.execute("SELECT version, summary FROM artifacts WHERE version = '2.0.0'").fetchone()
     assert row["summary"] == "A tiny demo package"
+    database.close()
+
+
+def test_migrate_recovers_a_change_committed_without_its_version_stamp(tmp_path: Path) -> None:
+    """An interrupted v2 (ALTER applied, version still 1) must self-repair."""
+    path = tmp_path / "partial.db"
+    seed_v1(path)
+
+    alter = next(_iter_statements(_SCHEMA_V2))
+    assert alter.upper().startswith("ALTER TABLE")
+    connection = sqlite3.connect(path)
+    connection.execute(alter)  # the schema change committed...
+    connection.commit()
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+    connection.close()  # ...but the version stamp never did
+
+    database = Database(path)
+    database.migrate()
+
+    assert database.schema_version == SCHEMA_VERSION
+    row = database.conn.execute("SELECT filename, packagetype, summary FROM artifacts").fetchone()
+    assert row["filename"] == WHEEL
+    assert row["packagetype"] == "bdist_wheel"
+    assert row["summary"] == ""
+    # The rest of v2 (the tokens table) was applied by the recovery.
+    assert database.conn.execute("SELECT COUNT(*) AS n FROM tokens").fetchone()["n"] == 0
+    database.close()
+
+
+def test_concurrent_migrators_do_not_conflict(tmp_path: Path) -> None:
+    """Two workers starting together must not both replay the ALTER TABLEs."""
+    path = tmp_path / "concurrent.db"
+    seed_v1(path)
+
+    barrier = threading.Barrier(2)
+    failures: list[Exception] = []
+
+    def run() -> None:
+        database = Database(path)
+        try:
+            barrier.wait()
+            database.migrate()
+        except Exception as exc:
+            failures.append(exc)
+        finally:
+            database.close()
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert failures == []
+    database = Database(path)
+    assert database.schema_version == SCHEMA_VERSION
+    row = database.conn.execute("SELECT packagetype, summary FROM artifacts").fetchone()
+    assert row["packagetype"] == "bdist_wheel"
+    assert row["summary"] == ""
+    database.close()
+
+
+def test_failed_migration_rolls_back_completely(tmp_path: Path, monkeypatch) -> None:
+    """A migration that fails part-way must leave no partial schema behind."""
+    path = tmp_path / "rollback.db"
+    database = Database(path)
+    database.migrate()
+    assert database.schema_version == SCHEMA_VERSION
+
+    broken = (
+        SCHEMA_VERSION + 1,
+        "CREATE TABLE partial (id INTEGER);\nINSERT INTO no_such_table VALUES (1);",
+    )
+    monkeypatch.setattr(db_module, "MIGRATIONS", (*db_module.MIGRATIONS, broken))
+
+    with pytest.raises(sqlite3.OperationalError):
+        database.migrate()
+
+    # The schema change from the failed step was rolled back with the rest.
+    assert database.schema_version == SCHEMA_VERSION
+    tables = {row[0] for row in database.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert "partial" not in tables
     database.close()

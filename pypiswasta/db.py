@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -98,6 +99,68 @@ ALTER TABLE artifacts ADD COLUMN summary TEXT NOT NULL DEFAULT '';
 MIGRATIONS: tuple[tuple[int, str], ...] = ((1, _SCHEMA_V1), (2, _SCHEMA_V2), (3, _SCHEMA_V3))
 
 
+def _iter_statements(script: str) -> Iterator[str]:
+    """Yield each complete SQL statement in ``script``.
+
+    ``Connection.executescript`` cannot run inside a transaction: it commits any
+    pending transaction before it starts, so an enclosing ``BEGIN`` would not
+    protect the schema changes. Executing the statements one at a time keeps the
+    whole migration -- schema changes *and* the version stamp -- in one
+    transaction.
+    """
+    buffer = ""
+    for line in script.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            if buffer.strip():
+                yield buffer.strip()
+            buffer = ""
+    if buffer.strip():
+        yield buffer.strip()
+
+
+def _apply_statement(conn: sqlite3.Connection, statement: str) -> None:
+    """Execute one migration statement, tolerating one that is already applied.
+
+    A database interrupted mid-migration can have a schema change committed
+    while ``user_version`` was never stamped. Re-running the script then hits
+    "duplicate column name"; that specific error means the change is already
+    present, so it is skipped and the rest of the migration continues.
+    """
+    try:
+        conn.execute(statement)
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" in str(exc).lower():
+            return
+        raise
+
+
+#: Bounded retry budget for the one-time switch to WAL while concurrent workers
+#: race to convert the same fresh database.
+_WAL_RETRY_ATTEMPTS = 50
+_WAL_RETRY_DELAY_SECONDS = 0.005
+
+
+def _enable_wal(conn: sqlite3.Connection) -> None:
+    """Switch the database to WAL, tolerating a concurrent conversion.
+
+    Every worker reaches this at once on a fresh database. Changing the journal
+    mode needs a brief exclusive lock, and SQLite reports "database is locked"
+    instead of waiting when another connection is performing the same
+    conversion. WAL is a persistent property of the file, so retry briefly; the
+    database stays usable in either mode, so give up gracefully rather than
+    failing startup.
+    """
+    for _ in range(_WAL_RETRY_ATTEMPTS):
+        try:
+            row = conn.execute("PRAGMA journal_mode = WAL").fetchone()
+        except sqlite3.OperationalError:
+            time.sleep(_WAL_RETRY_DELAY_SECONDS)
+            continue
+        if row is not None and str(row[0]).lower() == "wal":
+            return
+
+
 def _like_pattern(query: str) -> str:
     """A substring ``LIKE`` pattern for a project name.
 
@@ -151,14 +214,29 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = self._connect()
         try:
-            conn.execute("PRAGMA journal_mode = WAL")
+            _enable_wal(conn)
             conn.execute("PRAGMA synchronous = NORMAL")
-            version = conn.execute("PRAGMA user_version").fetchone()[0]
-            for target, script in MIGRATIONS:
-                if version < target:
-                    conn.executescript(script)
+            # Serialize concurrent migrators and make each step atomic.
+            # BEGIN IMMEDIATE takes the write lock *before* the version is read,
+            # so a second worker waits and then finds the schema already
+            # upgraded instead of both replaying an ALTER TABLE. Holding the
+            # same transaction across the upgrade and its ``user_version`` stamp
+            # keeps the two together, so an interruption cannot leave the schema
+            # ahead of the recorded version.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                for target, script in MIGRATIONS:
+                    if version >= target:
+                        continue
+                    for statement in _iter_statements(script):
+                        _apply_statement(conn, statement)
                     conn.execute(f"PRAGMA user_version = {target}")
                     version = target
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
         finally:
             conn.close()
 
