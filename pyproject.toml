@@ -6,7 +6,7 @@ license = "MPL-2.0"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "fastapi>=0.143.0",
+    "fastapi>=0.143.1",
     "granian>=2.8.4",
     "packaging>=26.3",
     "python-multipart>=0.0.32",
