@@ -833,3 +833,42 @@ client-identity design that the deployed reverse proxy has not been reviewed
 for, and the four bounds above already cap the amplification the review
 measured.
 
+### 15.16 CLI release yanking
+
+`pypiswasta package yank <name> <version> [--reason <text>]` and
+`pypiswasta package unyank <name> <version>` update release state directly in
+SQLite. Both accept `--config`; neither requires a service restart. There is no
+HTTP mutation endpoint for yanking. Unknown projects, unknown versions and
+invalid PEP 440 version arguments return a nonzero exit status.
+
+Schema v4 adds a sparse `yanked_releases` table keyed by `(package_id, version)`
+with a non-null reason string. `canonicalize_version()` supplies the version key,
+including trailing-zero normalization, so `1.2` and `1.2.0` share a yank while
+local versions retain their identity. The per-connection `canonical_version()`
+SQLite function applies the same normalization when joining artifacts to their
+yank state. Existing releases remain active when upgraded; no artifact rows or
+bytes need rewriting.
+
+The CLI takes the SQLite writer lock before checking existence and setting or
+clearing the yank. A yank row survives artifact replacement and deletion, so a
+later wheel or sdist for the same version inherits it. A release with no files
+can still be explicitly unyanked if its yank row remains. Deleting the whole
+project cascades to its yank records.
+
+Both public and private project indexes retain all file links and advertise the
+state using the [Simple API yanking fields](https://packaging.python.org/en/latest/specifications/simple-repository-api/#project-detail).
+Active entries omit the fields. Yanked HTML links carry an escaped `data-yanked`
+reason (possibly empty); JSON files carry `yanked` as a nonempty reason or `true`
+when there is no reason. Unyanking removes both markers. Artifact and sidecar
+downloads retain their existing visibility checks, hashes and bytes.
+
+Project HTML includes a CSS `a[data-yanked]::before` rule displaying a bold
+`(YANKED)` prefix. Generated content leaves the anchor text equal to the filename
+as required by the Simple API; the prefix disappears when `data-yanked` is removed.
+
+Installers use these markers to avoid yanked candidates during normal resolution;
+exact pins can still select them according to the client's policy. This follows
+the [file-yanking specification](https://packaging.python.org/en/latest/specifications/file-yanking/).
+Pre-release selection remains the installer's responsibility: release versions
+already accept development, alpha, beta and release-candidate suffixes.
+
