@@ -192,6 +192,21 @@ Give each publisher its own upload token so it can be revoked independently:
 pypiswasta token create github-actions --role upload --config /etc/pypiswasta/config.toml
 ```
 
+Use `--project` to restrict a token to one or more normalized project names:
+
+```sh
+pypiswasta token create release-bot --role upload --project my-package --config /etc/pypiswasta/config.toml
+pypiswasta token create private-installer --role reader --project internal-tools --config /etc/pypiswasta/config.toml
+```
+
+Repeat `--project` to allow several projects. A scoped token can be created
+before any of those projects exist; the scope is saved by name, and uploads can
+create the projects later. Uploads for other names are rejected.
+Reader tokens can use private indexes and downloads only for their listed
+projects. Scoped admin tokens are limited to the same projects for package
+listing and administration. Tokens created without `--project` retain access
+for every project allowed by their role.
+
 Save the token when it is displayed, then **restart the service**. Use `__token__`
 as the publishing username and the token as the password. Reader tokens can be
 created with `--role reader` for private installs.
@@ -200,6 +215,9 @@ created with `--role reader` for private installs.
 pypiswasta token list --config /etc/pypiswasta/config.toml
 pypiswasta token remove github-actions --config /etc/pypiswasta/config.toml
 ```
+
+The token list includes each token's project scope (`all` for an unrestricted
+token).
 
 Restart after creating or removing tokens; changes become active when the
 service reloads its credentials at startup.

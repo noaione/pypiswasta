@@ -271,6 +271,15 @@ def _cmd_token_create(args: argparse.Namespace) -> int:
         )
         return 1
 
+    project_names: set[str] = set()
+    for project_name in args.project:
+        try:
+            project_names.add(canonicalize_name(project_name, validate=True))
+        except ValueError as exc:
+            print(f"error: invalid project name {project_name!r}: {exc}", file=sys.stderr)
+            return 1
+    normalized_projects = tuple(sorted(project_names))
+
     secret = generate_token_secret()
     credential = build_credential(args.role, name, secret, algorithm=ALGORITHM_SHA256_DOMAIN)
     with database.write() as conn:
@@ -281,9 +290,14 @@ def _cmd_token_create(args: argparse.Namespace) -> int:
             algorithm=credential.algorithm,
             password_hash=credential.password_hash,
             hint=token_hint(secret),
+            project_names=normalized_projects,
         )
 
     print(f"created token {name!r} with the {credential.role} role")
+    if normalized_projects:
+        print(f"projects: {', '.join(normalized_projects)}")
+    else:
+        print("projects: all")
     print(f"token:   {secret}")
     print(f"summary: {token_hint(secret)}")
     print()
@@ -302,7 +316,9 @@ def _cmd_token_list(args: argparse.Namespace) -> int:
         print("no tokens")
         return 0
     for row in rows:
-        print(f"{row['name']}\t{row['role']}\t{row['hint']}\t{row['created_at']}")
+        projects = row["project_names"]
+        scope = ",".join(str(project) for project in projects) if isinstance(projects, tuple) else "all"
+        print(f"{row['name']}\t{row['role']}\t{row['hint']}\t{row['created_at']}\t{scope}")
     return 0
 
 
@@ -541,6 +557,13 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=ROLES,
         default="upload",
         help="capability the token carries (default: %(default)s)",
+    )
+    token_create.add_argument(
+        "--project",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="limit this token to a project name; repeat for multiple projects",
     )
     token_create.set_defaults(handler=_cmd_token_create)
 

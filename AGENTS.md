@@ -86,6 +86,11 @@ FastAPI's test client; do not depend on a production configuration or data store
 - Credentials and tokens are SQLite records loaded into an in-memory snapshot.
   Authentication performs no per-request database lookup. CLI mutations require
   a service restart; there is no general live reload or SIGHUP handler.
+- API tokens may have optional normalized project-name scopes. Store names
+  independently of project rows so operators can create a scoped token before
+  its project exists. Enforce scopes on uploads, private project and file reads,
+  scoped searches, and admin package listing/mutations. Unscoped tokens and role
+  credentials keep their role-wide behavior.
 - Generated role passwords have 256 bits of entropy and use domain-separated
   SHA-256 digests. Tokens use SHA-256; manually chosen administrator passwords
   use Argon2id. Preserve explicit algorithm identifiers and constant-time digest
@@ -125,6 +130,9 @@ FastAPI's test client; do not depend on a production configuration or data store
   JSON. Keep files and sidecars downloadable under the existing visibility rules.
   The HTML page uses CSS `a[data-yanked]::before` for the visible `(YANKED)`
   marker; preserve the actual anchor text as the exact distribution filename.
+- Schema v5 stores optional token project scopes in `token_projects`. Names use
+  canonical PEP 503 project-name normalization and do not reference `packages`,
+  so a token can be scoped before its project is created.
 - GC must recheck live references and delete candidates while holding the same
   SQLite writer lock used by publishing. Blob age alone is insufficient:
   re-publishing identical bytes can make an old orphan live again.

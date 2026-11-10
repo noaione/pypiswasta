@@ -12,13 +12,13 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
 from packaging.utils import canonicalize_name, canonicalize_version
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 ROLES = ("admin", "upload", "reader")
 
@@ -108,7 +108,24 @@ CREATE TABLE IF NOT EXISTS yanked_releases (
 );
 """
 
-MIGRATIONS: tuple[tuple[int, str], ...] = ((1, _SCHEMA_V1), (2, _SCHEMA_V2), (3, _SCHEMA_V3), (4, _SCHEMA_V4))
+# v5 lets API tokens carry a set of normalized project names. Names are stored
+# directly rather than linked to ``packages`` so a token can be scoped before
+# its first project upload.
+_SCHEMA_V5 = """
+CREATE TABLE IF NOT EXISTS token_projects (
+    token_id    INTEGER NOT NULL REFERENCES tokens(id) ON DELETE CASCADE,
+    project_name TEXT NOT NULL,
+    PRIMARY KEY (token_id, project_name)
+);
+"""
+
+MIGRATIONS: tuple[tuple[int, str], ...] = (
+    (1, _SCHEMA_V1),
+    (2, _SCHEMA_V2),
+    (3, _SCHEMA_V3),
+    (4, _SCHEMA_V4),
+    (5, _SCHEMA_V5),
+)
 
 
 def _iter_statements(script: str) -> Iterator[str]:
@@ -213,7 +230,7 @@ class Database:
 
     def __init__(self, path: str | Path, busy_timeout_ms: int = 5000) -> None:
         self.path = Path(path)
-        self.busy_timeout_ms = int(busy_timeout_ms)
+        self.busy_timeout_ms = busy_timeout_ms
         self._local = threading.local()
 
     # -- connection management ------------------------------------------------
@@ -283,7 +300,7 @@ class Database:
         return int(self.conn.execute("PRAGMA user_version").fetchone()[0])
 
     @contextmanager
-    def write(self) -> Iterator[sqlite3.Connection]:
+    def write(self) -> Generator[sqlite3.Connection, None, None]:
         """Short ``BEGIN IMMEDIATE`` write transaction."""
         conn = self.conn
         conn.execute("BEGIN IMMEDIATE")
@@ -307,7 +324,7 @@ class Database:
             "INSERT INTO packages (name, private) VALUES (?, ?)",
             (name, 1 if private else 0),
         )
-        return int(cursor.lastrowid or 0)
+        return cursor.lastrowid or 0
 
     def set_package_private(self, conn: sqlite3.Connection, name: str, private: bool) -> bool:
         cursor = conn.execute(
@@ -617,8 +634,15 @@ class Database:
 
     # -- tokens ---------------------------------------------------------------
 
-    def list_tokens(self) -> list[sqlite3.Row]:
-        return list(self.conn.execute("SELECT * FROM tokens ORDER BY name").fetchall())
+    def list_tokens(self) -> list[dict[str, object]]:
+        """List tokens and their optional project scopes for CLI and auth load."""
+        rows = self.conn.execute("SELECT * FROM tokens ORDER BY name").fetchall()
+        if not rows:
+            return []
+        scopes: dict[int, list[str]] = {}
+        for row in self.conn.execute("SELECT token_id, project_name FROM token_projects ORDER BY project_name"):
+            scopes.setdefault(int(row["token_id"]), []).append(row["project_name"])
+        return [{**dict(row), "project_names": tuple(scopes.get(int(row["id"]), ())) or None} for row in rows]
 
     def get_token(self, name: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM tokens WHERE name = ?", (name,)).fetchone()
@@ -632,11 +656,17 @@ class Database:
         algorithm: str,
         password_hash: str,
         hint: str,
+        project_names: Sequence[str] = (),
     ) -> None:
-        conn.execute(
+        cursor = conn.execute(
             "INSERT INTO tokens (name, role, algorithm, password_hash, hint) VALUES (?, ?, ?, ?, ?)",
             (name, role, algorithm, password_hash, hint),
         )
+        if project_names:
+            conn.executemany(
+                "INSERT INTO token_projects (token_id, project_name) VALUES (?, ?)",
+                ((cursor.lastrowid, project_name) for project_name in project_names),
+            )
 
     def delete_token(self, conn: sqlite3.Connection, name: str) -> bool:
         cursor = conn.execute("DELETE FROM tokens WHERE name = ?", (name,))

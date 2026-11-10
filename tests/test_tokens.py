@@ -263,6 +263,102 @@ def test_reader_token_can_read_the_private_index(config_path: Path) -> None:
         assert client.post("/legacy/", auth=("ci-read", secret)).status_code == 403
 
 
+def test_scoped_upload_token_can_precede_project_creation(config_path: Path) -> None:
+    credentials = initialize(config_path)
+    secret, _ = create_token(config_path, "ci-scoped", "--project", "My.Package")
+
+    _, listed, _ = run_cli("token", "list", "--config", str(config_path))
+    assert "\tmy-package" in listed
+
+    with TestClient(create_app(config_path)) as client:
+        instance = Instance(client=client, credentials=credentials)
+        allowed = instance.upload(
+            build_wheel("my-package"),
+            wheel_filename("my-package"),
+            auth=("ci-scoped", secret),
+        )
+        assert allowed.status_code == 200, allowed.text
+
+        denied = instance.upload(
+            build_wheel("other-package"),
+            wheel_filename("other-package"),
+            auth=("ci-scoped", secret),
+        )
+        assert denied.status_code == 403
+
+
+def test_scoped_reader_token_is_limited_to_private_project_and_file(config_path: Path) -> None:
+    credentials = initialize(config_path)
+    with TestClient(create_app(config_path)) as client:
+        instance = Instance(client=client, credentials=credentials)
+        secret_upload = instance.upload(build_wheel("secret"), wheel_filename("secret"))
+        other_upload = instance.upload(build_wheel("other"), wheel_filename("other"))
+        assert secret_upload.status_code == 200
+        assert other_upload.status_code == 200
+
+    token, _ = create_token(config_path, "ci-read-secret", "--role", "reader", "--project", "secret")
+    secret_digest = secret_upload.json()["sha256"]
+    other_digest = other_upload.json()["sha256"]
+
+    with TestClient(create_app(config_path)) as client:
+        root = client.get("/private/simple/", auth=("ci-read-secret", token))
+        assert root.status_code == 200
+        assert 'href="/private/simple/secret/"' in root.text
+        assert 'href="/private/simple/other/"' not in root.text
+        assert client.get("/private/simple/secret/", auth=("ci-read-secret", token)).status_code == 200
+        assert client.get("/private/simple/other/", auth=("ci-read-secret", token)).status_code == 404
+        search = client.get("/search", params={"q": "e"}, auth=("ci-read-secret", token))
+        assert search.status_code == 200
+        assert "secret" in search.text
+        assert "other" not in search.text
+
+        assert (
+            client.get(
+                f"/private/files/{secret_digest}/{wheel_filename('secret')}",
+                auth=("ci-read-secret", token),
+            ).status_code
+            == 200
+        )
+        assert (
+            client.get(
+                f"/private/files/{other_digest}/{wheel_filename('other')}",
+                auth=("ci-read-secret", token),
+            ).status_code
+            == 404
+        )
+
+
+def test_scoped_admin_token_lists_and_mutates_only_allowed_projects(config_path: Path) -> None:
+    credentials = initialize(config_path)
+    with TestClient(create_app(config_path)) as client:
+        instance = Instance(client=client, credentials=credentials)
+        assert instance.upload(build_wheel("allowed"), wheel_filename("allowed")).status_code == 200
+        assert instance.upload(build_wheel("blocked"), wheel_filename("blocked")).status_code == 200
+
+    token, _ = create_token(config_path, "ci-admin-allowed", "--role", "admin", "--project", "allowed")
+    with TestClient(create_app(config_path)) as client:
+        response = client.get("/api/admin/packages", auth=("ci-admin-allowed", token))
+        assert response.status_code == 200
+        assert [package["name"] for package in response.json()["packages"]] == ["allowed"]
+
+        assert (
+            client.patch(
+                "/api/admin/packages/blocked",
+                json={"visibility": "public"},
+                auth=("ci-admin-allowed", token),
+            ).status_code
+            == 404
+        )
+        assert (
+            client.patch(
+                "/api/admin/packages/allowed",
+                json={"visibility": "public"},
+                auth=("ci-admin-allowed", token),
+            ).status_code
+            == 200
+        )
+
+
 def test_admin_token_reaches_the_admin_api(config_path: Path) -> None:
     initialize(config_path)
     secret, _ = create_token(config_path, "ci-admin", "--role", "admin")

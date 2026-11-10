@@ -23,7 +23,7 @@ import re
 import secrets
 import threading
 from dataclasses import dataclass
-from typing import Any, Iterable, Protocol, SupportsIndex, overload
+from typing import Any, Iterable, Protocol
 
 from argon2 import PasswordHasher
 from argon2.exceptions import (
@@ -152,6 +152,11 @@ class Credential:
     username: str
     algorithm: str
     password_hash: str
+    project_names: frozenset[str] | None = None
+
+    def allows_project(self, project_name: str) -> bool:
+        """Whether this credential may act on a normalized project name."""
+        return self.project_names is None or project_name in self.project_names
 
 
 def verify_credential(credential: Credential, password: str) -> bool:
@@ -198,10 +203,7 @@ def generate_credential(role: str, *, username: str | None = None) -> tuple[Cred
 class _RowLike(Protocol):
     """Anything indexable by column name: a ``sqlite3.Row`` or a plain mapping."""
 
-    @overload  # Note: really needs int instead of SupportsIndex
-    def __getitem__(self, key: int | str, /) -> Any: ...
-    @overload  # Note: SupportsIndex does work within slices.
-    def __getitem__(self, key: slice[SupportsIndex | None], /) -> tuple[Any, ...]: ...
+    def __getitem__(self, key: str, /) -> Any: ...
 
 
 class AuthStore:
@@ -234,11 +236,16 @@ class AuthStore:
         # ``credential_for_role`` reports.
         token_credentials: list[Credential] = []
         for token_row in tokens:
+            try:
+                raw_project_names = token_row["project_names"]
+            except (IndexError, KeyError):
+                raw_project_names = None
             credential = Credential(
                 role=token_row["role"],
                 username=token_row["name"],
                 algorithm=token_row["algorithm"],
                 password_hash=token_row["password_hash"],
+                project_names=frozenset(raw_project_names) if raw_project_names else None,
             )
             if credential.username in by_username:
                 raise ValueError(f"token {credential.username!r} collides with another credential username")
@@ -261,7 +268,7 @@ class AuthStore:
     def reload(self, database: db_module.Database) -> None:
         self.install(
             database.list_credentials(),  # pyright: ignore[reportArgumentType]
-            database.list_tokens(),  # pyright: ignore[reportArgumentType]
+            database.list_tokens(),
         )
 
     @property

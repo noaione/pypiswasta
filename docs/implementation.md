@@ -872,3 +872,25 @@ the [file-yanking specification](https://packaging.python.org/en/latest/specific
 Pre-release selection remains the installer's responsibility: release versions
 already accept development, alpha, beta and release-candidate suffixes.
 
+### 15.17 Project-scoped API tokens
+
+`pypiswasta token create` accepts repeatable `--project <name>` options. Names
+are validated and stored in canonical PEP 503 form. A token may be scoped to a
+project before that project exists, allowing a publisher to be provisioned
+before its first upload. Creating a token without `--project` preserves the
+existing role-wide behavior; existing tokens remain unrestricted after upgrade.
+
+Schema v5 adds `token_projects`, keyed by token ID and normalized project name.
+The names intentionally do not reference package rows, so project deletion and
+recreation do not silently change a token's scope. Removing a token cascades to
+its scope rows. The CLI list displays the scope, and token changes still require
+a service restart because authentication reads the records into its startup
+snapshot.
+
+Every token role retains its assigned capability and gains a project boundary.
+Uploads outside the scope receive `403`; private project indexes and artifact
+or metadata downloads outside it return `404`. Reader search results and the
+admin package list are filtered by scope, and admin mutations outside the scope
+also return `404`. Role credentials and tokens without scopes retain their
+existing behavior.
+

@@ -305,6 +305,8 @@ def _install_routes(app: FastAPI) -> None:
                 query=query,
                 include_private=credential is not None,
             )
+            if credential is not None:
+                rows = [row for row in rows if credential.allows_project(row["name"])]
             results = [(row["name"], bool(row["private"]), int(row["file_count"])) for row in rows]
 
         return web.search_page(
@@ -343,6 +345,8 @@ def _install_routes(app: FastAPI) -> None:
                 summary_terms=query.summary_terms,
                 include_private=credential is not None,
             )
+            if credential is not None:
+                rows = [row for row in rows if credential.allows_project(row["name"])]
             return rpc.select_hits(rows, query)
 
         # Both the XML parsing above and the SQL below are blocking, and this is
@@ -437,11 +441,24 @@ def _install_routes(app: FastAPI) -> None:
 
     @app.api_route("/private/simple/", methods=["GET", "HEAD"])
     def private_root(request: Request, credential: ReaderCredential) -> Response:
-        return _root_index(request, visibility=None, prefix="/private", cache=CACHE_PRIVATE_INDEX)
+        return _root_index(
+            request,
+            visibility=None,
+            prefix="/private",
+            cache=CACHE_PRIVATE_INDEX,
+            project_names=credential.project_names,
+        )
 
     @app.api_route("/private/simple/{name}/", methods=["GET", "HEAD"])
     def private_project(request: Request, name: str, credential: ReaderCredential) -> Response:
-        return _project_index(request, name, visibility=None, prefix="/private", cache=CACHE_PRIVATE_INDEX)
+        return _project_index(
+            request,
+            name,
+            visibility=None,
+            prefix="/private",
+            cache=CACHE_PRIVATE_INDEX,
+            project_names=credential.project_names,
+        )
 
     # -- file downloads ------------------------------------------------------
 
@@ -451,7 +468,14 @@ def _install_routes(app: FastAPI) -> None:
 
     @app.api_route("/private/files/{digest}/{filename}", methods=["GET", "HEAD"])
     def private_file(request: Request, digest: str, filename: str, credential: ReaderCredential) -> Response:
-        return _serve_file(request, digest, filename, visibility=None, cache=CACHE_PRIVATE_FILE)
+        return _serve_file(
+            request,
+            digest,
+            filename,
+            visibility=None,
+            cache=CACHE_PRIVATE_FILE,
+            project_names=credential.project_names,
+        )
 
     # -- upload --------------------------------------------------------------
 
@@ -463,7 +487,7 @@ def _install_routes(app: FastAPI) -> None:
     @app.post("/legacy", include_in_schema=False)
     @app.post("/legacy/")
     async def legacy_upload(request: Request, credential: UploadCredential) -> Response:
-        return await _handle_upload(request)
+        return await _handle_upload(request, project_names=credential.project_names)
 
     # -- admin API -----------------------------------------------------------
 
@@ -476,7 +500,9 @@ def _install_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=400, detail="invalid visibility filter")
 
         packages = []
-        for row in database.list_projects(visibility=visibility, query=query or None):
+        rows = database.list_projects(visibility=visibility, query=query or None)
+        rows = [row for row in rows if credential.allows_project(row["name"])]
+        for row in rows:
             artifacts = database.list_artifacts(row["id"])
             packages.append({
                 "name": row["name"],
@@ -512,6 +538,8 @@ def _install_routes(app: FastAPI) -> None:
 
         private = _resolve_visibility(payload)
         normalized = _normalize_name(name)
+        if not credential.allows_project(normalized):
+            raise _not_found()
         with database.write() as conn:
             updated = database.set_package_private(conn, normalized, private)
         if not updated:
@@ -525,6 +553,8 @@ def _install_routes(app: FastAPI) -> None:
     def admin_delete_file(request: Request, name: str, filename: str, credential: AdminCredential) -> Response:
         _, database, _, _ = _state(request)
         normalized = _normalize_name(name)
+        if not credential.allows_project(normalized):
+            raise _not_found()
         with database.write() as conn:
             package = database.get_package(normalized)
             if package is None:
@@ -540,6 +570,8 @@ def _install_routes(app: FastAPI) -> None:
     def admin_delete_package(request: Request, name: str, credential: AdminCredential) -> Response:
         _, database, _, _ = _state(request)
         normalized = _normalize_name(name)
+        if not credential.allows_project(normalized):
+            raise _not_found()
         package = database.get_package(normalized)
         if package is None:
             raise _not_found()
@@ -558,9 +590,18 @@ def _install_routes(app: FastAPI) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _root_index(request: Request, *, visibility: str | None, prefix: str, cache: str) -> Response:
+def _root_index(
+    request: Request,
+    *,
+    visibility: str | None,
+    prefix: str,
+    cache: str,
+    project_names: frozenset[str] | None = None,
+) -> Response:
     _, database, _, _ = _state(request)
     names = [row["name"] for row in database.list_installable_projects(visibility=visibility)]
+    if project_names is not None:
+        names = [name for name in names if name in project_names]
     negotiated = simple.negotiate(request.headers.get("accept"))
     headers = {"Vary": "Accept", "Cache-Control": cache}
     if negotiated.format == simple.FORMAT_JSON:
@@ -576,9 +617,19 @@ def _root_index(request: Request, *, visibility: str | None, prefix: str, cache:
     )
 
 
-def _project_index(request: Request, raw_name: str, *, visibility: str | None, prefix: str, cache: str) -> Response:
+def _project_index(
+    request: Request,
+    raw_name: str,
+    *,
+    visibility: str | None,
+    prefix: str,
+    cache: str,
+    project_names: frozenset[str] | None = None,
+) -> Response:
     _, database, _, _ = _state(request)
     name = _normalize_name(raw_name)
+    if project_names is not None and name not in project_names:
+        raise _not_found()
     package = database.get_package(name)
     if package is None:
         raise _not_found()
@@ -618,6 +669,7 @@ def _serve_file(
     *,
     visibility: str | None,
     cache: str,
+    project_names: frozenset[str] | None = None,
 ) -> Response:
     _, database, store, _ = _state(request)
 
@@ -635,6 +687,8 @@ def _serve_file(
     if row is None:
         raise _not_found()
     if visibility == "public" and row["package_private"]:
+        raise _not_found()
+    if project_names is not None and row["package_name"] not in project_names:
         raise _not_found()
 
     path = store.metadata_path(row["metadata_sha256"]) if is_sidecar else store.object_path(row["sha256"])
@@ -725,7 +779,7 @@ async def _parse_upload_form(request: Request, *, max_body_bytes: int, max_file_
         return await parser.parse()
 
 
-async def _handle_upload(request: Request) -> Response:
+async def _handle_upload(request: Request, *, project_names: frozenset[str] | None = None) -> Response:
     config, database, store, _ = _state(request)
 
     content_type = request.headers.get("content-type", "")
@@ -748,7 +802,14 @@ async def _handle_upload(request: Request) -> Response:
         raise HTTPException(status_code=400, detail=exc.message) from exc
 
     try:
-        return await _store_upload(form, config=config, database=database, store=store, max_bytes=max_bytes)
+        return await _store_upload(
+            form,
+            config=config,
+            database=database,
+            store=store,
+            max_bytes=max_bytes,
+            project_names=project_names,
+        )
     finally:
         # Parsed multipart file parts are spooled temporary files; close them
         # deterministically instead of leaning on garbage collection.
@@ -762,6 +823,7 @@ async def _store_upload(
     database: Database,
     store: ObjectStore,
     max_bytes: int,
+    project_names: frozenset[str] | None = None,
 ) -> Response:
     action = form.get(":action")
     if action is not None and str(action) != UPLOAD_ACTION:
@@ -801,6 +863,8 @@ async def _store_upload(
         raise HTTPException(status_code=400, detail="upload has no filename")
 
     expected_name, expected_version = _parse_filename_strict(filename)
+    if project_names is not None and expected_name not in project_names:
+        raise HTTPException(status_code=403, detail="token is not allowed to publish this project")
 
     # The filename decides the format; a client that declares something else is
     # contradicting itself, and the filename is what installers will parse.
@@ -861,6 +925,10 @@ async def _store_upload(
         store.discard(staged)
         raise
 
+    if project_names is not None and info.name not in project_names:
+        store.discard(staged)
+        raise HTTPException(status_code=403, detail="token is not allowed to publish this project")
+
     metadata_digest = hashlib.sha256(info.metadata_bytes).hexdigest()
     default_private = config.repository.default_visibility != "public"
     allow_overwrite = config.repository.allow_overwrite
@@ -888,7 +956,7 @@ async def _store_upload(
 
             # Publish immutable objects before the reference becomes visible.
             store.publish_bytes(info.metadata_bytes, METADATA_KIND, metadata_digest)
-            store.publish_file(pending, OBJECT_KIND, digest)
+            store.publish_file(staged, OBJECT_KIND, digest)
             pending = None  # moved into the content-addressed store
 
             database.upsert_artifact(
