@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Generator
@@ -28,6 +29,7 @@ from pypiswasta.db import ALGORITHM_SHA256_DOMAIN
 
 TOKEN_SECRET = re.compile(r"^token:\s+(\S+)$", re.MULTILINE)
 TOKEN_SUMMARY = re.compile(r"^summary:\s+(\S+)$", re.MULTILINE)
+REPLACEMENT_TOKEN = re.compile(r"^replacement token:\s+(\S+)$", re.MULTILINE)
 
 
 def run_cli(*args: str) -> tuple[int, str, str]:
@@ -46,6 +48,26 @@ def create_token(config_path: Path, name: str, *extra: str) -> tuple[str, str]:
     hint = TOKEN_SUMMARY.search(out)
     assert secret is not None and hint is not None, out
     return secret.group(1), hint.group(1)
+
+
+def wait_for_status(client: TestClient, path: str, auth: object, expected: int):
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        response = client.get(path, auth=auth)
+        if response.status_code == expected:
+            return response
+        time.sleep(0.025)
+    pytest.fail(f"{path} did not return {expected} within the auth refresh window")
+
+
+def wait_for_upload(instance: Instance, wheel: bytes, filename: str, auth: object, expected: int):
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        response = instance.upload(wheel, filename, auth=auth)
+        if response.status_code == expected:
+            return response
+        time.sleep(0.025)
+    pytest.fail(f"upload of {filename} did not return {expected} within the auth refresh window")
 
 
 def initialize(config_path: Path) -> dict[str, tuple[str, str]]:
@@ -127,7 +149,7 @@ def test_create_prints_the_secret_once(config_path: Path) -> None:
     assert re.search(r"^token:\s+pypisw_\S+$", out, re.MULTILINE)
     assert "created token 'ci-publish' with the upload role" in out
     assert "not written to disk or logged in plaintext" in out
-    assert "restart the PyPISwasta service" in out
+    assert "apply this change automatically" in out
     # The token must be offered under both accepted usernames.
     assert f"username: ci-publish  (or {TOKEN_SENTINEL})" in out
 
@@ -373,32 +395,75 @@ def test_admin_token_reaches_the_admin_api(config_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_a_new_token_is_not_live_until_the_service_restarts(config_path: Path) -> None:
-    """Documents the in-memory snapshot: the CLI writes, the service must reload."""
-    with TestClient(create_app(config_path)) as early:
-        assert early.post("/setup", data={"username": ADMIN_USERNAME}).status_code == 200
-        code, out, err = run_cli("token", "create", "later", "--config", str(config_path))
+def test_created_and_removed_tokens_refresh_without_restart(config_path: Path) -> None:
+    initialize(config_path)
+    with TestClient(create_app(config_path)) as client:
+        code, out, err = run_cli(
+            "token",
+            "create",
+            "live-admin",
+            "--role",
+            "admin",
+            "--config",
+            str(config_path),
+        )
         assert code == 0, err
         secret = TOKEN_SECRET.search(out)
         assert secret is not None
+        auth = ("live-admin", secret.group(1))
 
-        # This app instance loaded its snapshot before the token existed.
-        assert early.get("/api/admin/packages", auth=("later", secret.group(1))).status_code == 401
+        response = wait_for_status(client, "/api/admin/packages", auth, 200)
+        assert response.json() == {"packages": []}
 
-
-def test_a_removed_token_stops_working_after_a_restart(config_path: Path) -> None:
-    initialize(config_path)
-    secret, _ = create_token(config_path, "ci-publish")
-
-    with TestClient(create_app(config_path)) as client:
-        assert client.get("/api/admin/packages", auth=("ci-publish", secret)).status_code == 403
+        code, out, err = run_cli("token", "remove", "live-admin", "--config", str(config_path))
+        assert code == 0, err
+        assert "automatically within about one second" in out
+        wait_for_status(client, "/api/admin/packages", auth, 401)
         assert client.get("/healthz").status_code == 200
 
-    assert run_cli("token", "remove", "ci-publish", "--config", str(config_path))[0] == 0
 
+def test_token_role_and_scope_updates_refresh_without_restart(config_path: Path) -> None:
     with TestClient(create_app(config_path)) as client:
-        assert client.get("/healthz").status_code == 200
-        assert client.get("/api/admin/packages", auth=("ci-publish", secret)).status_code == 401
+        setup = client.post("/setup", data={"username": ADMIN_USERNAME})
+        assert setup.status_code == 200
+        secret, _ = create_token(config_path, "live-publisher", "--project", "first")
+        instance = Instance(client=client, credentials={})
+        auth = ("live-publisher", secret)
+        first_wheel = build_wheel("first")
+        second_wheel = build_wheel("second")
+
+        wait_for_upload(instance, first_wheel, wheel_filename("first"), auth, 200)
+
+        code, out, err = run_cli(
+            "token",
+            "update",
+            "live-publisher",
+            "--project",
+            "second",
+            "--config",
+            str(config_path),
+        )
+        assert code == 0, err
+        assert "automatically within about one second" in out
+        wait_for_upload(instance, second_wheel, wheel_filename("second"), auth, 200)
+        assert instance.upload(first_wheel, wheel_filename("first"), auth=auth).status_code == 403
+
+        code, out, err = run_cli(
+            "token",
+            "update",
+            "live-publisher",
+            "--role",
+            "reader",
+            "--all-projects",
+            "--config",
+            str(config_path),
+        )
+        assert code == 0, err
+        replacement = REPLACEMENT_TOKEN.search(out)
+        assert replacement is not None
+        replacement_auth = ("live-publisher", replacement.group(1))
+        wait_for_status(client, "/private/simple/", replacement_auth, 200)
+        assert client.get("/private/simple/", auth=auth).status_code == 401
 
 
 # --------------------------------------------------------------------------- #

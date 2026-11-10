@@ -207,20 +207,27 @@ projects. Scoped admin tokens are limited to the same projects for package
 listing and administration. Tokens created without `--project` retain access
 for every project allowed by their role.
 
-Save the token when it is displayed, then **restart the service**. Use `__token__`
-as the publishing username and the token as the password. Reader tokens can be
-created with `--role reader` for private installs.
+Save the token when it is displayed. Use `__token__` as the publishing username
+and the token as the password. Reader tokens can be created with `--role reader`
+for private installs. The running service picks up token changes automatically,
+usually within one second; no restart is needed.
 
 ```sh
 pypiswasta token list --config /etc/pypiswasta/config.toml
 pypiswasta token remove github-actions --config /etc/pypiswasta/config.toml
+pypiswasta token update release-bot --project package-one --project package-two --config /etc/pypiswasta/config.toml
+pypiswasta token update release-bot --all-projects --config /etc/pypiswasta/config.toml
 ```
 
-The token list includes each token's project scope (`all` for an unrestricted
-token).
+`token update` replaces the project scope when given `--project`, clears it
+with `--all-projects`, and leaves it unchanged when neither is supplied. It can
+also change the token role with `--role`; changing roles creates and prints a
+replacement secret once because token hashes are tied to their role. Update the
+client to use that replacement. The token list includes each token's project
+scope (`all` for an unrestricted token).
 
-Restart after creating or removing tokens; changes become active when the
-service reloads its credentials at startup.
+Role credentials and token records refresh automatically while the service is
+running. Restart only after changing configuration.
 
 ## Install packages
 
@@ -305,7 +312,8 @@ pypiswasta auth set-admin-password --config /etc/pypiswasta/config.toml
 
 `reset-password` works for all three roles and displays a new password once;
 `rotate` is an alias. `set-admin-password` prompts for a password you choose.
-Restart after changing credentials, tokens or configuration:
+Restart after changing configuration. Credential and token changes refresh
+automatically while the service is running.
 
 ```sh
 sudo systemctl restart pypiswasta

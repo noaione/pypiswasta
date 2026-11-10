@@ -18,7 +18,7 @@ from pathlib import Path
 
 from packaging.utils import canonicalize_name, canonicalize_version
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 ROLES = ("admin", "upload", "reader")
 
@@ -119,12 +119,62 @@ CREATE TABLE IF NOT EXISTS token_projects (
 );
 """
 
+# v6 tracks changes to auth records without making requests query SQLite. A
+# server worker polls this revision and reloads its in-memory snapshot as needed.
+_SCHEMA_V6 = """
+CREATE TABLE IF NOT EXISTS auth_state (
+    id       INTEGER PRIMARY KEY CHECK (id = 1),
+    revision INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO auth_state (id, revision) VALUES (1, 0);
+
+CREATE TRIGGER IF NOT EXISTS credentials_auth_insert AFTER INSERT ON credentials
+BEGIN
+    UPDATE auth_state SET revision = revision + 1 WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS credentials_auth_update AFTER UPDATE ON credentials
+BEGIN
+    UPDATE auth_state SET revision = revision + 1 WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS credentials_auth_delete AFTER DELETE ON credentials
+BEGIN
+    UPDATE auth_state SET revision = revision + 1 WHERE id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS tokens_auth_insert AFTER INSERT ON tokens
+BEGIN
+    UPDATE auth_state SET revision = revision + 1 WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS tokens_auth_update AFTER UPDATE ON tokens
+BEGIN
+    UPDATE auth_state SET revision = revision + 1 WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS tokens_auth_delete AFTER DELETE ON tokens
+BEGIN
+    UPDATE auth_state SET revision = revision + 1 WHERE id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS token_projects_auth_insert AFTER INSERT ON token_projects
+BEGIN
+    UPDATE auth_state SET revision = revision + 1 WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS token_projects_auth_update AFTER UPDATE ON token_projects
+BEGIN
+    UPDATE auth_state SET revision = revision + 1 WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS token_projects_auth_delete AFTER DELETE ON token_projects
+BEGIN
+    UPDATE auth_state SET revision = revision + 1 WHERE id = 1;
+END;
+"""
+
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _SCHEMA_V1),
     (2, _SCHEMA_V2),
     (3, _SCHEMA_V3),
     (4, _SCHEMA_V4),
     (5, _SCHEMA_V5),
+    (6, _SCHEMA_V6),
 )
 
 
@@ -594,6 +644,32 @@ class Database:
     def list_credentials(self) -> list[sqlite3.Row]:
         return list(self.conn.execute("SELECT * FROM credentials ORDER BY role").fetchall())
 
+    def auth_revision(self) -> int:
+        """Current revision for role credentials, tokens and their scopes."""
+        row = self.conn.execute("SELECT revision FROM auth_state WHERE id = 1").fetchone()
+        if row is None:  # pragma: no cover - protected by the v6 migration
+            raise RuntimeError("auth revision row is missing")
+        return int(row["revision"])
+
+    def load_auth_state(self) -> tuple[int, list[sqlite3.Row], list[dict[str, object]]]:
+        """Read auth records and their revision from one consistent snapshot."""
+        conn = self.conn
+        conn.execute("BEGIN")
+        try:
+            revision_row = conn.execute("SELECT revision FROM auth_state WHERE id = 1").fetchone()
+            if revision_row is None:  # pragma: no cover - protected by the v6 migration
+                raise RuntimeError("auth revision row is missing")
+            revision = int(revision_row["revision"])
+            credentials = list(conn.execute("SELECT * FROM credentials ORDER BY role").fetchall())
+            token_rows = conn.execute("SELECT * FROM tokens ORDER BY name").fetchall()
+            tokens = self._tokens_with_scopes(conn, token_rows)
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        return revision, credentials, tokens
+
     def get_credential(self, role: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM credentials WHERE role = ?", (role,)).fetchone()
 
@@ -637,10 +713,17 @@ class Database:
     def list_tokens(self) -> list[dict[str, object]]:
         """List tokens and their optional project scopes for CLI and auth load."""
         rows = self.conn.execute("SELECT * FROM tokens ORDER BY name").fetchall()
+        return self._tokens_with_scopes(self.conn, rows)
+
+    @staticmethod
+    def _tokens_with_scopes(
+        conn: sqlite3.Connection,
+        rows: Sequence[sqlite3.Row],
+    ) -> list[dict[str, object]]:
         if not rows:
             return []
         scopes: dict[int, list[str]] = {}
-        for row in self.conn.execute("SELECT token_id, project_name FROM token_projects ORDER BY project_name"):
+        for row in conn.execute("SELECT token_id, project_name FROM token_projects ORDER BY project_name"):
             scopes.setdefault(int(row["token_id"]), []).append(row["project_name"])
         return [{**dict(row), "project_names": tuple(scopes.get(int(row["id"]), ())) or None} for row in rows]
 
@@ -671,6 +754,40 @@ class Database:
     def delete_token(self, conn: sqlite3.Connection, name: str) -> bool:
         cursor = conn.execute("DELETE FROM tokens WHERE name = ?", (name,))
         return cursor.rowcount > 0
+
+    def update_token(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        name: str,
+        role: str | None = None,
+        password_hash: str | None = None,
+        hint: str | None = None,
+        project_names: Sequence[str] | None = None,
+    ) -> bool:
+        """Update a token role and/or replace its project scope.
+
+        ``project_names=None`` leaves the current scope unchanged; an empty
+        sequence removes the scope and restores role-wide access.
+        """
+        row = conn.execute("SELECT id FROM tokens WHERE name = ?", (name,)).fetchone()
+        if row is None:
+            return False
+        token_id = int(row["id"])
+        if role is not None:
+            if password_hash is None or hint is None:
+                raise ValueError("changing a token role requires a replacement secret hash and hint")
+            conn.execute(
+                "UPDATE tokens SET role = ?, password_hash = ?, hint = ? WHERE id = ?",
+                (role, password_hash, hint, token_id),
+            )
+        if project_names is not None:
+            conn.execute("DELETE FROM token_projects WHERE token_id = ?", (token_id,))
+            conn.executemany(
+                "INSERT INTO token_projects (token_id, project_name) VALUES (?, ?)",
+                ((token_id, project_name) for project_name in project_names),
+            )
+        return True
 
     def usernames_in_use(self) -> set[str]:
         """Every HTTP Basic username currently claimed, across both tables.

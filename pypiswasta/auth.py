@@ -159,6 +159,16 @@ class Credential:
         return self.project_names is None or project_name in self.project_names
 
 
+@dataclass(frozen=True, slots=True)
+class _AuthSnapshot:
+    by_username: dict[str, Credential]
+    by_role: dict[str, Credential]
+    tokens: tuple[Credential, ...]
+    dummy_hash: str | None
+    initialized: bool
+    revision: int | None
+
+
 def verify_credential(credential: Credential, password: str) -> bool:
     if credential.algorithm == db_module.ALGORITHM_ARGON2ID:
         return verify_argon2(credential.password_hash, password)
@@ -210,13 +220,16 @@ class AuthStore:
     """Immutable username -> credential map with atomic snapshot swaps."""
 
     def __init__(self) -> None:
-        self._by_username: dict[str, Credential] = {}
-        self._by_role: dict[str, Credential] = {}
-        self._tokens: tuple[Credential, ...] = ()
-        self._initialized = False
-        self._dummy_hash: str | None = None
+        self._snapshot = _AuthSnapshot({}, {}, (), None, False, None)
+        self._snapshot_lock = threading.Lock()
 
-    def install(self, rows: Iterable[_RowLike], tokens: Iterable[_RowLike] = ()) -> None:
+    def install(
+        self,
+        rows: Iterable[_RowLike],
+        tokens: Iterable[_RowLike] = (),
+        *,
+        revision: int | None = None,
+    ) -> None:
         by_username: dict[str, Credential] = {}
         by_role: dict[str, Credential] = {}
         for row in rows:
@@ -259,41 +272,49 @@ class AuthStore:
         dummy_hash = hash_argon2("pypiswasta-dummy-password") if uses_argon2 else None
 
         # Replace each prepared collection intact rather than mutating it.
-        self._by_username = by_username
-        self._by_role = by_role
-        self._tokens = tuple(token_credentials)
-        self._dummy_hash = dummy_hash
-        self._initialized = "admin" in by_role
-
-    def reload(self, database: db_module.Database) -> None:
-        self.install(
-            database.list_credentials(),  # pyright: ignore[reportArgumentType]
-            database.list_tokens(),
+        new_snapshot = _AuthSnapshot(
+            by_username=by_username,
+            by_role=by_role,
+            tokens=tuple(token_credentials),
+            dummy_hash=dummy_hash,
+            initialized="admin" in by_role,
+            revision=revision,
         )
+        with self._snapshot_lock:
+            current_revision = self._snapshot.revision
+            if revision is not None and current_revision is not None and revision < current_revision:
+                return
+            self._snapshot = new_snapshot
+
+    def reload(self, database: db_module.Database) -> int:
+        revision, credentials, tokens = database.load_auth_state()
+        self.install(credentials, tokens, revision=revision)  # pyright: ignore[reportArgumentType]
+        return revision
 
     @property
     def initialized(self) -> bool:
         """True once an administrator credential exists."""
-        return self._initialized
+        return self._snapshot.initialized
 
     def credential_for_role(self, role: str) -> Credential | None:
-        return self._by_role.get(role)
+        return self._snapshot.by_role.get(role)
 
     def usernames(self) -> dict[str, str]:
-        return {role: cred.username for role, cred in self._by_role.items()}
+        return {role: cred.username for role, cred in self._snapshot.by_role.items()}
 
     def authenticate(self, username: str, password: str) -> Credential | None:
-        credential = self._by_username.get(username)
+        snapshot = self._snapshot
+        credential = snapshot.by_username.get(username)
         if credential is None:
             # ``__token__`` carries no identity of its own, so the secret decides
             # which token this is.
             if username == TOKEN_SENTINEL:
-                return self._match_token(password)
+                return self._match_token(password, snapshot.tokens)
             # Only pay for a timing-equalising Argon2 burn when a slow KDF is
             # actually in use. A store of fast SHA-256 digests has nothing to
             # hide, and burning tens of MiB per unknown username would hand an
             # anonymous caller a trivial denial-of-service amplifier.
-            dummy_hash = self._dummy_hash
+            dummy_hash = snapshot.dummy_hash
             if dummy_hash is not None:
                 verify_argon2(dummy_hash, password)
             return None
@@ -301,14 +322,15 @@ class AuthStore:
             return credential
         return None
 
-    def _match_token(self, password: str) -> Credential | None:
+    @staticmethod
+    def _match_token(password: str, tokens: tuple[Credential, ...]) -> Credential | None:
         """Return the token whose secret is ``password``, if any.
 
         A scan is affordable because tokens are few and verification is a single
         SHA-256. It is also the only option: the store holds digests, so there is
         no plaintext to index the lookup by.
         """
-        for credential in self._tokens:
+        for credential in tokens:
             if verify_credential(credential, password):
                 return credential
         return None

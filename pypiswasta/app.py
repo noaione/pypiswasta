@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import logging
 import os
-from contextlib import aclosing
+from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
 from typing import Annotated, AsyncGenerator
 from urllib.parse import unquote
@@ -50,6 +52,8 @@ from .storage import DigestError, ObjectStore, validate_digest
 from .wheels import inspect_wheel, parse_wheel_filename_strict
 
 CONFIG_ENV_VAR = "PYPISWASTA_CONFIG"
+AUTH_REFRESH_INTERVAL_SECONDS = 0.5
+_logger = logging.getLogger(__name__)
 
 METADATA_EXTENSION = ".metadata"
 UPLOAD_ACTION = "file_upload"
@@ -106,7 +110,7 @@ class SetupGateMiddleware:
             # completed setup. Adopt the database's state rather than keeping
             # the gate closed (which would keep serving /setup forever).
             if app.state.database.is_initialized():
-                auth_store.reload(app.state.database)
+                await anyio.to_thread.run_sync(auth_store.reload, app.state.database)
 
         if auth_store.initialized:
             await self.app(scope, receive, send)
@@ -126,6 +130,37 @@ class SetupGateMiddleware:
         await response(scope, receive, send)
 
 
+async def _watch_auth_changes(app: FastAPI) -> None:
+    """Reload auth snapshots after CLI or other-process credential changes."""
+    database: Database = app.state.database
+    auth_store: AuthStore = app.state.auth
+    revision = app.state.auth_revision
+    while True:
+        await asyncio.sleep(AUTH_REFRESH_INTERVAL_SECONDS)
+        try:
+            if database.auth_revision() == revision:
+                continue
+            revision = await anyio.to_thread.run_sync(auth_store.reload, database)
+            app.state.auth_revision = revision
+        except Exception:
+            # Keep serving the last good snapshot and retry on the next poll.
+            _logger.exception("could not refresh the authentication snapshot")
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    watcher = asyncio.create_task(_watch_auth_changes(app))
+    try:
+        yield
+    finally:
+        watcher.cancel()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass
+        app.state.database.close()
+
+
 def create_app(config_path: str | Path | None = None) -> FastAPI:
     """Build the ASGI application.
 
@@ -142,7 +177,7 @@ def create_app(config_path: str | Path | None = None) -> FastAPI:
     database.migrate()
 
     auth_store = AuthStore()
-    auth_store.reload(database)
+    auth_revision = auth_store.reload(database)
 
     app = FastAPI(
         title="PyPISwasta",
@@ -152,11 +187,13 @@ def create_app(config_path: str | Path | None = None) -> FastAPI:
         # Trailing-slash redirects are handled explicitly below so the Location
         # header stays relative and can never drop the Authorization header.
         redirect_slashes=False,
+        lifespan=_lifespan,
     )
     app.state.config = config
     app.state.database = database
     app.state.store = store
     app.state.auth = auth_store
+    app.state.auth_revision = auth_revision
 
     app.add_middleware(SetupGateMiddleware)
 

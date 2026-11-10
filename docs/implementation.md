@@ -883,9 +883,8 @@ existing role-wide behavior; existing tokens remain unrestricted after upgrade.
 Schema v5 adds `token_projects`, keyed by token ID and normalized project name.
 The names intentionally do not reference package rows, so project deletion and
 recreation do not silently change a token's scope. Removing a token cascades to
-its scope rows. The CLI list displays the scope, and token changes still require
-a service restart because authentication reads the records into its startup
-snapshot.
+its scope rows. The CLI list displays the scope. Authentication still uses an
+in-memory snapshot rather than querying SQLite during requests.
 
 Every token role retains its assigned capability and gains a project boundary.
 Uploads outside the scope receive `403`; private project indexes and artifact
@@ -893,4 +892,27 @@ or metadata downloads outside it return `404`. Reader search results and the
 admin package list are filtered by scope, and admin mutations outside the scope
 also return `404`. Role credentials and tokens without scopes retain their
 existing behavior.
+
+### 15.18 Live credential and token refresh
+
+Schema v6 adds the singleton `auth_state` revision row and triggers on
+`credentials`, `tokens` and `token_projects`. Every committed insert, update or
+delete advances the revision inside the same SQLite transaction as the auth
+change. Package and artifact writes do not advance it.
+
+Each server worker polls the revision every 500 ms in its FastAPI lifespan. On a
+change, it reads the revision, role credentials, tokens and project scopes in
+one SQLite read transaction, prepares the replacement snapshot off the event
+loop, then swaps the complete snapshot atomically. Requests continue to verify
+credentials against memory and do not query auth tables. Workers normally apply
+CLI changes within about one second. If loading a snapshot fails, the worker
+keeps the last valid snapshot and retries on the next poll.
+
+`pypiswasta token update <name>` changes a role, replaces project scopes with
+repeatable `--project` arguments, or clears restrictions with `--all-projects`.
+Omitting both scope options keeps the current scope. Changing a role also
+rotates the token secret and prints the replacement once because token digests
+are role-domain-separated. Create, update, remove and role credential commands
+take effect without restarting the service; changing the TOML configuration
+still requires a restart.
 

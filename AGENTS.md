@@ -84,8 +84,9 @@ FastAPI's test client; do not depend on a production configuration or data store
   the SQLite write transaction; stale workers and overlapping requests must not
   replace committed credentials or display another setup attempt's secrets.
 - Credentials and tokens are SQLite records loaded into an in-memory snapshot.
-  Authentication performs no per-request database lookup. CLI mutations require
-  a service restart; there is no general live reload or SIGHUP handler.
+  Authentication performs no per-request database lookup. A background watcher
+  polls the auth revision and refreshes snapshots after credential changes, so
+  CLI mutations become active without a service restart.
 - API tokens may have optional normalized project-name scopes. Store names
   independently of project rows so operators can create a scoped token before
   its project exists. Enforce scopes on uploads, private project and file reads,
@@ -133,6 +134,9 @@ FastAPI's test client; do not depend on a production configuration or data store
 - Schema v5 stores optional token project scopes in `token_projects`. Names use
   canonical PEP 503 project-name normalization and do not reference `packages`,
   so a token can be scoped before its project is created.
+- Schema v6 tracks auth-table mutations in `auth_state`; triggers update the
+  revision in the same transaction. Workers poll it every 500 ms and atomically
+  install a consistent credentials-and-tokens snapshot when it changes.
 - GC must recheck live references and delete candidates while holding the same
   SQLite writer lock used by publishing. Blob age alone is insufficient:
   re-publishing identical bytes can make an old orphan live again.

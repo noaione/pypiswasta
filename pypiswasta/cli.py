@@ -47,12 +47,9 @@ from .storage import ObjectStore
 
 DEFAULT_DATA_DIR = "/var/lib/pypiswasta"
 
-# Credentials are loaded into an in-memory snapshot at startup, so any command
-# that changes them needs the service restarted (there is no SIGHUP reload).
-_RESTART_HINT = (
-    "restart the PyPISwasta service to make this take effect; credentials are "
-    "cached in memory and the database is only read at startup"
-)
+# Credential changes are picked up from SQLite by the running server's
+# background auth-revision watcher.
+_AUTH_REFRESH_HINT = "the running service will apply this change automatically within about one second"
 
 
 def _open_db(config: Config) -> Database:
@@ -159,10 +156,7 @@ def _cmd_auth_reset_password(args: argparse.Namespace) -> int:
     print(f"username: {credential.username}")
     print(f"password: {password}")
     print("store it now; it is not written to disk or logged in plaintext")
-    print(
-        "restart the PyPISwasta service to make this take effect; credentials are "
-        "cached in memory and the database is only read at startup"
-    )
+    print(_AUTH_REFRESH_HINT)
     return 0
 
 
@@ -212,7 +206,8 @@ def _cmd_auth_set_username(args: argparse.Namespace) -> int:
         return 1
 
     print(f"{role} username set to {username}")
-    print("update any client that saved the old username, then restart the service")
+    print("update any client that saved the old username")
+    print(_AUTH_REFRESH_HINT)
     return 0
 
 
@@ -271,14 +266,11 @@ def _cmd_token_create(args: argparse.Namespace) -> int:
         )
         return 1
 
-    project_names: set[str] = set()
-    for project_name in args.project:
-        try:
-            project_names.add(canonicalize_name(project_name, validate=True))
-        except ValueError as exc:
-            print(f"error: invalid project name {project_name!r}: {exc}", file=sys.stderr)
-            return 1
-    normalized_projects = tuple(sorted(project_names))
+    try:
+        normalized_projects = _normalize_token_projects(args.project)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     secret = generate_token_secret()
     credential = build_credential(args.role, name, secret, algorithm=ALGORITHM_SHA256_DOMAIN)
@@ -304,8 +296,18 @@ def _cmd_token_create(args: argparse.Namespace) -> int:
     print(f"username: {name}  (or {TOKEN_SENTINEL})")
     print("password: the token above")
     print("store it now; it is not written to disk or logged in plaintext")
-    print(_RESTART_HINT)
+    print(_AUTH_REFRESH_HINT)
     return 0
+
+
+def _normalize_token_projects(project_names: list[str]) -> tuple[str, ...]:
+    normalized: set[str] = set()
+    for project_name in project_names:
+        try:
+            normalized.add(canonicalize_name(project_name, validate=True))
+        except ValueError as exc:
+            raise ValueError(f"invalid project name {project_name!r}: {exc}") from exc
+    return tuple(sorted(normalized))
 
 
 def _cmd_token_list(args: argparse.Namespace) -> int:
@@ -331,7 +333,53 @@ def _cmd_token_remove(args: argparse.Namespace) -> int:
         print(f"error: unknown token: {args.name}", file=sys.stderr)
         return 1
     print(f"removed token {args.name}")
-    print(_RESTART_HINT)
+    print(_AUTH_REFRESH_HINT)
+    return 0
+
+
+def _cmd_token_update(args: argparse.Namespace) -> int:
+    if args.role is None and args.project is None and not args.all_projects:
+        print("error: provide --role, --project or --all-projects", file=sys.stderr)
+        return 1
+
+    try:
+        project_names = _normalize_token_projects(args.project) if args.project is not None else None
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if args.all_projects:
+        project_names = ()
+
+    replacement_secret: str | None = None
+    replacement_credential = None
+    if args.role is not None:
+        replacement_secret = generate_token_secret()
+        replacement_credential = build_credential(
+            args.role,
+            args.name,
+            replacement_secret,
+            algorithm=ALGORITHM_SHA256_DOMAIN,
+        )
+
+    config = load_config(args.config)
+    database = _open_db(config)
+    with database.write() as conn:
+        updated = database.update_token(
+            conn,
+            name=args.name,
+            role=args.role,
+            password_hash=replacement_credential.password_hash if replacement_credential else None,
+            hint=token_hint(replacement_secret) if replacement_secret else None,
+            project_names=project_names,
+        )
+    if not updated:
+        print(f"error: unknown token: {args.name}", file=sys.stderr)
+        return 1
+    print(f"updated token {args.name}")
+    if replacement_secret is not None:
+        print(f"replacement token: {replacement_secret}")
+        print("store it now; it is not written to disk or logged in plaintext")
+    print(_AUTH_REFRESH_HINT)
     return 0
 
 
@@ -577,6 +625,24 @@ def _build_parser() -> argparse.ArgumentParser:
     token_remove = token_sub.add_parser("remove", parents=[common], help="delete a token")
     token_remove.add_argument("name")
     token_remove.set_defaults(handler=_cmd_token_remove)
+
+    token_update = token_sub.add_parser("update", parents=[common], help="change a token role or project scope")
+    token_update.add_argument("name")
+    token_update.add_argument("--role", choices=ROLES, help="change the token role")
+    scope_update = token_update.add_mutually_exclusive_group()
+    scope_update.add_argument(
+        "--project",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help="replace the allowed projects; repeat for multiple projects",
+    )
+    scope_update.add_argument(
+        "--all-projects",
+        action="store_true",
+        help="remove the project restriction",
+    )
+    token_update.set_defaults(handler=_cmd_token_update)
 
     package = subparsers.add_parser("package", help="inspect and manage projects")
     package_sub = package.add_subparsers(dest="package_command")
